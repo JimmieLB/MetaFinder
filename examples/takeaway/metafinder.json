@@ -1,0 +1,4 @@
+{
+  "entry": "takeaway:GAME",
+  "config": { "stones": 21, "max_take": 3 }
+}

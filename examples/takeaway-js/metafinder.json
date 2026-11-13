@@ -1,0 +1,5 @@
+{
+  "runtime": "node",
+  "entry": "takeaway.mjs:GAME",
+  "config": { "stones": 21, "max_take": 3 }
+}

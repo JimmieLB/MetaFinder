@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MetaFinder</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --surface: #ffffff; --surface-2: #f0eee8; --border: #e2dfd6;
+    --text: #1c1b18; --muted: #6b675d; --accent: #2f5d50; --accent-soft: #dfeae5;
+    --win: #2e7d4f; --win-soft: #dcefe2; --loss: #b4442f; --loss-soft: #f6e0da;
+    --warn: #9a6a12; --warn-soft: #f5ead2; --bar: #2f5d50; --bar-track: #ebe8e0;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141513; --surface: #1c1d1a; --surface-2: #242521; --border: #33352f;
+      --text: #ecebe6; --muted: #9b998f; --accent: #8cc7b2; --accent-soft: #23352f;
+      --win: #7cc995; --win-soft: #1f3226; --loss: #e9907d; --loss-soft: #3a2420;
+      --warn: #e2b866; --warn-soft: #3a3020; --bar: #8cc7b2; --bar-track: #2b2c28;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 40px 16px 80px; }
+  h1 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 14px; letter-spacing: -0.01em; }
+  h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  .tagline { color: var(--muted); margin-bottom: 28px; max-width: 640px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  form .row { display: flex; gap: 10px; }
+  input, textarea { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border);
+                    border-radius: 8px; padding: 10px 12px; width: 100%; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  textarea { font-family: var(--mono); font-size: 13px; min-height: 72px; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 10px 18px; cursor: pointer;
+           background: var(--accent); color: var(--bg); white-space: nowrap; }
+  button.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); font-weight: 500; }
+  button:disabled { opacity: .5; cursor: default; }
+  details summary { cursor: pointer; color: var(--muted); margin-top: 14px; user-select: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 12px; }
+  label { font-size: 13px; color: var(--muted); display: block; }
+  label input { margin-top: 4px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  .chip { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); }
+  button.chip { font-weight: 500; color: var(--text); }
+  .error { background: var(--loss-soft); color: var(--loss); border-radius: 8px; padding: 10px 12px; margin-top: 12px; white-space: pre-wrap; }
+  pre { font-family: var(--mono); font-size: 12px; overflow-x: auto; background: var(--surface-2); padding: 12px; border-radius: 8px; margin: 8px 0 0; }
+
+  /* progress */
+  .phases { display: flex; gap: 6px; margin: 4px 0 14px; flex-wrap: wrap; }
+  .phase { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--surface-2); color: var(--muted); }
+  .phase.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .phase.done { color: var(--text); }
+  .phase.done::before { content: "✓ "; color: var(--win); }
+  .track { height: 6px; background: var(--bar-track); border-radius: 3px; overflow: hidden; }
+  .fill { height: 100%; background: var(--bar); transition: width .3s; }
+  .progress-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .jobid { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; }
+  .jobid code { font-size: 14px; user-select: all; }
+  .jobid button, .open-row button { padding: 5px 12px; font-size: 13px; }
+  .open-row { display: flex; gap: 8px; margin-top: 14px; align-items: center; }
+  .open-row input { padding: 6px 10px; font-family: var(--mono); font-size: 13px; max-width: 320px; }
+  .open-row span { font-size: 13px; white-space: nowrap; }
+  .chip .st { font-size: 11px; margin-left: 4px; }
+  .st.running, .st.queued, .st.cloning { color: var(--accent); }
+  .st.done { color: var(--win); } .st.error { color: var(--loss); } .st.cancelled, .st.gone { color: var(--muted); }
+
+  /* results */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: var(--surface-2); border-radius: 10px; padding: 12px 14px; }
+  .stat .v { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .insight { display: flex; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+  .insight:first-of-type { border-top: 0; padding-top: 0; }
+  .tag { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; padding: 3px 8px; border-radius: 6px;
+         height: fit-content; min-width: 74px; text-align: center; }
+  .tag.strategy { background: var(--accent-soft); color: var(--accent); }
+  .tag.balance { background: var(--warn-soft); color: var(--warn); }
+  .tag.design { background: var(--loss-soft); color: var(--loss); }
+  .tag.skill { background: var(--win-soft); color: var(--win); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; }
+  .barcell { width: 32%; min-width: 90px; }
+  .minibar { height: 8px; background: var(--bar-track); border-radius: 4px; overflow: hidden; }
+  .minibar > div { height: 100%; background: var(--bar); }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; margin-left: 6px; }
+  .badge.win { background: var(--win-soft); color: var(--win); }
+  .badge.loss { background: var(--loss-soft); color: var(--loss); }
+  .badge.draw { background: var(--warn-soft); color: var(--warn); }
+  .best td:first-child { font-weight: 650; }
+  .pv { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .pv .step { font-size: 13px; padding: 3px 9px; border-radius: 6px; background: var(--surface-2); }
+  .pv .step.p0 { border-left: 3px solid var(--accent); }
+  .pv .step.p1 { border-left: 3px solid var(--warn); }
+  .pv .step.chance { font-style: italic; color: var(--muted); }
+  .pv .arrow { color: var(--muted); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .scroll { max-height: 420px; overflow-y: auto; }
+  .check { display: flex; gap: 8px; padding: 4px 0; }
+  .check .icon { width: 18px; flex: none; }
+  .ok { color: var(--win); } .warning { color: var(--warn); } .err { color: var(--loss); }
+  .transcript td { font-size: 13px; }
+  .transcript .pos { color: var(--muted); font-size: 12px; }
+  code { font-family: var(--mono); font-size: 13px; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+  .hidden { display: none !important; }
+  @media (max-width: 720px) {
+    .two { grid-template-columns: 1fr; }
+    form .row { flex-direction: column; }
+    main { padding-top: 24px; }
+    .barcell { width: 25%; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>MetaFinder</h1>
+  <p class="tagline">Point it at a game repo with a headless MetaFinder module. It plays the game thousands of times with Monte Carlo Tree Search and reports the strongest strategy, balance problems and dominated options.</p>
+
+  <section class="card">
+    <form id="form">
+      <div class="row">
+        <input id="url" placeholder="https://github.com/owner/repo  (or /tree/branch/path/to/game)" autocomplete="off" required>
+        <button id="go" type="submit">Analyze</button>
+      </div>
+      <div class="chips hidden" id="examples"><span class="muted" style="font-size:13px">Try a bundled example:</span></div>
+      <details>
+        <summary>Search budget &amp; game config</summary>
+        <div class="grid">
+          <label>MCTS iterations per move<input id="iterations" type="number" value="800" min="20"></label>
+          <label>Self-play games<input id="games" type="number" value="20" min="2"></label>
+          <label>Opening search iterations<input id="opening_iterations" type="number" value="20000" min="100"></label>
+          <label>Exploration constant (c)<input id="exploration" type="number" value="0.7" step="0.05" min="0.05"></label>
+          <label>Rollout depth cap<input id="rollout_depth" type="number" placeholder="module default" min="1"></label>
+          <label>Seed<input id="seed" type="number" value="1"></label>
+        </div>
+        <label style="margin-top:12px">Config overrides (JSON, passed to <code>new_game(seed, config)</code>)
+          <textarea id="config" placeholder='{"max_hp": 20}'></textarea></label>
+      </details>
+      <div id="formError" class="error hidden"></div>
+    </form>
+    <form class="open-row" id="openForm">
+      <span class="muted">Have a job ID?</span>
+      <input id="openId" placeholder="job ID or link" autocomplete="off" spellcheck="false">
+      <button class="secondary" type="submit">Open</button>
+    </form>
+    <div class="chips hidden" id="recent"><span class="muted" style="font-size:13px">Your recent jobs:</span></div>
+  </section>
+
+  <section class="card hidden" id="progress">
+    <div class="progress-head">
+      <h2 id="progressTitle" style="margin:0">Analyzing…</h2>
+      <button class="secondary" id="cancel" type="button">Cancel</button>
+    </div>
+    <div class="jobid">
+      <span class="muted">Job ID</span> <code id="jobId"></code>
+      <button class="secondary" type="button" id="copyId">Copy ID</button>
+      <button class="secondary" type="button" id="copyLink">Copy link</button>
+      <span class="muted">You can leave this page: open the link or enter the ID later to check progress.</span>
+    </div>
+    <div class="phases" id="phases" style="margin-top:12px"></div>
+    <div class="track"><div class="fill" id="fill" style="width:0"></div></div>
+    <p class="muted" id="progressMsg" style="margin:10px 0 0;font-size:14px"></p>
+    <div id="jobError" class="hidden"></div>
+  </section>
+
+  <div id="results"></div>
+
+  <section class="card">
+    <details>
+      <summary style="margin:0">How to make a game compatible</summary>
+      <p style="margin-top:14px">A compatible game ships a <strong>headless rules module</strong> in Python: no graphics, input, sound, network or clocks. MetaFinder imports it into its own process and calls it hundreds of thousands of times per run, so the rules have to be fast and in-process.</p>
+
+      <h3 style="margin-top:18px">Languages</h3>
+      <table>
+        <tr><th>Game written in</th><th>Supported?</th></tr>
+        <tr><td>Python 3.10+, standard library only</td><td><strong>Yes</strong>, the intended case</td></tr>
+        <tr><td>Python + third-party packages (numpy, pygame…)</td><td>Only if MetaFinder's environment already has them. Your <code>requirements.txt</code> is <em>not</em> installed.</td></tr>
+        <tr><td>pygame / arcade / Ren'Py games</td><td>Yes, if the rules are separate from the game loop (no window, input or <code>sleep</code>)</td></tr>
+        <tr><td>Compiled extensions (Cython, PyO3…), or C/C++/Rust via <code>ctypes</code></td><td>Only with a committed prebuilt binary for this OS, CPU and Python version. Nothing is built.</td></tr>
+        <tr><td>JS/TS, C# (Unity), GDScript (Godot), Lua, Java…</td><td><strong>No.</strong> Port the rules (not the UI) to Python. Subprocess or HTTP wrappers are far too slow.</td></tr>
+      </table>
+      <p class="muted" style="font-size:14px">The clone is shallow (<code>--depth 1</code>). Git submodules and Git LFS files are not fetched.</p>
+
+      <h3 style="margin-top:18px">Layout</h3>
+      <pre>my-game/                        ← repo root, or the folder you link with /tree/&lt;branch&gt;/&lt;path&gt;
+├── metafinder.json             ← { "entry": "my_game.metafinder_adapter:GAME",
+│                                   "config": { "starting_hp": 20 } }
+├── my_game/
+│   ├── __init__.py
+│   ├── rules.py                ← pure logic, no UI imports
+│   └── metafinder_adapter.py   ← defines GAME
+└── ui/, assets/ …              ← ignored</pre>
+      <p class="muted" style="font-size:14px"><code>entry</code> is <code>module.path:attr</code>, relative to that folder (<code>attr</code> defaults to <code>GAME</code>; a class or factory gets called). <code>config</code> is passed to <code>new_game</code>, and the config box here overrides it. Shortcut: a <code>metafinder_game.py</code> defining <code>GAME</code>. Don't name your package <code>metafinder</code> or shadow stdlib modules.</p>
+
+      <h3 style="margin-top:18px">Game object</h3>
+      <pre>name, num_players, perfect_information               required
+new_game(seed, config) -&gt; State                     required; setup randomness from seed only
+max_steps = 500                                     optional cap on actions per game
+rollout_depth                                       optional; playouts stop here and use heuristic_value()
+default_rollout_policy(state, rng) -&gt; action        optional, smarter playouts</pre>
+
+      <h3 style="margin-top:18px">State object</h3>
+      <pre>clone()            -&gt; fully independent copy, and FAST (avoid copy.deepcopy)
+current_player()   -&gt; 0..n-1, or -1 for a chance node (draws, dice, shuffles)
+legal_actions()    -&gt; non-empty list, no duplicates, deterministic order
+apply(action)      -&gt; mutate in place, deterministically
+is_terminal()      -&gt; bool
+returns()          -&gt; one value per player in 0..1 (1 win, 0 loss, 0.5 draw)
+
+chance_outcomes()  -&gt; [(outcome, probability)] summing to 1   if current_player() can be -1
+determinize(observer, rng) -&gt; NEW state                        if perfect_information is False
+                      re-randomize only what observer can't see; keep their legal actions
+to_json()          -&gt; complete state as JSON (strongly recommended: powers the checks)
+heuristic_value()  -&gt; like returns(), for unfinished games
+describe(), action_label(a), strategy_key(), drain_events()     improve the report</pre>
+
+      <h3 style="margin-top:18px">Rules that trip people up</h3>
+      <ul style="margin:0;padding-left:20px;line-height:1.6">
+        <li><strong>Actions are values</strong>: ints, strings, tuples or frozen dataclasses. Not lists or dicts, and not objects compared by identity. Give every action a distinct label.</li>
+        <li><strong>No hidden randomness</strong>: no global <code>random</code>, <code>time</code> or <code>uuid</code> inside <code>apply</code>. Randomness after setup must be a chance node. Every game is replayed from its seed to check this.</li>
+        <li>Don't build <code>legal_actions()</code> from a <code>set</code> of strings, because the order changes between runs.</li>
+        <li>In perfect-information games, a deck shuffled in <code>new_game</code> is visible to the search. Model draws as chance nodes, or declare hidden information.</li>
+        <li>Simultaneous moves: make them sequential and hide the pending choice with <code>determinize</code>. Real-time games: discretize into decision points. Multi-part turns: one action per step plus "end turn".</li>
+        <li>Keep it to tens of actions per decision. Abstract larger action spaces.</li>
+      </ul>
+      <p style="margin-top:14px" class="muted">Test locally by pasting a folder path into the box above. The Conformance phase reports problems before analysis starts. See <code>examples/takeaway</code> and <code>examples/minidecks</code> for working modules.</p>
+      <p class="muted">Analysis runs the repository's Python code on this machine. Only analyze repos you trust.</p>
+    </details>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PHASES = [["clone", "Fetch"], ["load", "Load"], ["validate", "Conformance"], ["opening", "Opening search"],
+                ["selfplay", "Self-play"], ["baseline", "vs Random"]];
+let pollTimer = null, currentJob = null;
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const md = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+const pct = (x, d = 0) => (x == null ? "–" : (x * 100).toFixed(d) + "%");
+const num = (x) => Number(x).toLocaleString();
+const bar = (x) => `<div class="minibar"><div style="width:${Math.max(0, Math.min(1, x)) * 100}%"></div></div>`;
+const badge = (p) => p ? `<span class="badge ${p}">${p === "win" ? "forced win" : p === "loss" ? "forced loss" : "draw"}</span>` : "";
+
+fetch("/api/examples").then(r => r.json()).then(list => {
+  if (!list.length) return;
+  const box = $("examples"); box.classList.remove("hidden");
+  for (const ex of list) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip"; b.textContent = ex.name;
+    b.onclick = () => { $("url").value = ex.path; $("form").requestSubmit(); };
+    box.appendChild(b);
+  }
+}).catch(() => {});
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("formError").classList.add("hidden");
+  let config = {};
+  const raw = $("config").value.trim();
+  if (raw) {
+    try { config = JSON.parse(raw); } catch { return showFormError("Config overrides must be valid JSON."); }
+  }
+  const body = { repo_url: $("url").value, config };
+  for (const k of ["iterations", "games", "opening_iterations", "exploration", "rollout_depth", "seed"]) {
+    const v = $(k).value; if (v !== "") body[k] = Number(v);
+  }
+  $("go").disabled = true;
+  try {
+    const r = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : data.detail.map(d => `${d.loc.at(-1)}: ${d.msg}`).join("\n"));
+    rememberJob(data.id, body.repo_url);
+    startPolling(data.id);
+  } catch (err) { showFormError(err.message); }
+  $("go").disabled = false; // jobs keep running on the server, so another one can be started any time
+});
+
+function showFormError(msg) { $("formError").textContent = msg; $("formError").classList.remove("hidden"); }
+
+$("cancel").onclick = () => currentJob && fetch(`/api/jobs/${encodeURIComponent(currentJob)}`, { method: "DELETE" });
+
+// ---- job IDs: shareable link, "open by ID", and this browser's recent jobs
+const ACTIVE = ["queued", "cloning", "running"];
+const RECENT_KEY = "metafinder.recentJobs";
+const loadRecent = () => { try { return JSON.parse(localStorage.getItem(RECENT_KEY)) || []; } catch { return []; } };
+const saveRecent = (list) => { try { localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 8))); } catch {} };
+function rememberJob(id, repo) {
+  const list = loadRecent();
+  const old = list.find(j => j.id === id);
+  saveRecent([{ id, repo: repo || old?.repo || "", at: old?.at || Date.now() }, ...list.filter(j => j.id !== id)]);
+}
+const forgetJob = (id) => saveRecent(loadRecent().filter(j => j.id !== id));
+
+/** Accepts a bare ID or a pasted link containing ?job=<id>. */
+function parseJobId(text) {
+  text = text.trim();
+  try { const q = new URL(text).searchParams.get("job"); if (q) text = q; } catch {}
+  return /^[A-Za-z0-9_-]{4,64}$/.test(text) ? text : null;
+}
+function jobLink(id) { const u = new URL(location.href); u.search = ""; u.hash = ""; u.searchParams.set("job", id); return u.href; }
+function setUrlJob(id) {
+  const u = new URL(location.href);
+  if (id) u.searchParams.set("job", id); else u.searchParams.delete("job");
+  history.replaceState(null, "", u);
+}
+
+async function copyText(button, text) {
+  const label = button.textContent;
+  try { await navigator.clipboard.writeText(text); button.textContent = "Copied"; }
+  catch { window.prompt("Copy this:", text); }
+  setTimeout(() => { button.textContent = label; }, 1200);
+}
+$("copyId").onclick = () => currentJob && copyText($("copyId"), currentJob);
+$("copyLink").onclick = () => currentJob && copyText($("copyLink"), jobLink(currentJob));
+
+$("openForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const id = parseJobId($("openId").value);
+  if (!id) return showFormError("That doesn't look like a job ID.");
+  $("formError").classList.add("hidden");
+  $("openId").value = "";
+  startPolling(id);
+});
+
+const shortRepo = (repo) => (repo || "").replace(/^https:\/\/github\.com\//, "").replace(/\/$/, "");
+
+/** Shows this browser's recent jobs with their current status; returns them (minus ones the server forgot). */
+async function renderRecent() {
+  const list = loadRecent();
+  const statuses = await Promise.all(list.map(j =>
+    fetch(`/api/jobs/${encodeURIComponent(j.id)}`)
+      .then(r => (r.status === 404 ? "gone" : r.ok ? r.json().then(job => job.status) : "unknown"))
+      .catch(() => "unknown")));
+  const box = $("recent");
+  box.querySelectorAll("button").forEach(b => b.remove());
+  const kept = [];
+  list.forEach((j, i) => {
+    if (statuses[i] === "gone") return forgetJob(j.id); // lost in a server restart
+    kept.push({ ...j, status: statuses[i] });
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip";
+    b.title = `Job ${j.id}`;
+    b.innerHTML = `${esc(shortRepo(j.repo) || j.id)} <span class="st ${esc(statuses[i])}">${esc(statuses[i])}</span>`;
+    b.onclick = () => startPolling(j.id);
+    box.appendChild(b);
+  });
+  box.classList.toggle("hidden", kept.length === 0);
+  return kept;
+}
+
+function showGone(id) {
+  clearInterval(pollTimer);
+  forgetJob(id);
+  setUrlJob(null);
+  $("progressTitle").textContent = "Job not found";
+  $("cancel").classList.add("hidden");
+  $("phases").innerHTML = ""; $("fill").style.width = "0"; $("progressMsg").textContent = "";
+  $("jobError").className = "error";
+  $("jobError").textContent = `There's no job with ID ${id}. Check the ID. Jobs are kept in memory, so they are also lost when the server restarts or redeploys.`;
+  renderRecent();
+}
+
+function startPolling(id) {
+  currentJob = id;
+  setUrlJob(id);
+  $("jobId").textContent = id;
+  $("results").innerHTML = "";
+  $("jobError").classList.add("hidden");
+  $("progress").classList.remove("hidden");
+  $("cancel").classList.remove("hidden");
+  $("progressTitle").textContent = "Analyzing…";
+  $("phases").innerHTML = ""; $("fill").style.width = "0"; $("progressMsg").textContent = "Loading job…";
+  clearInterval(pollTimer);
+  let failures = 0, finished = false, remembered = false;
+  const tick = async () => {
+    let r;
+    try { r = await fetch(`/api/jobs/${encodeURIComponent(id)}`); }
+    catch { if (++failures >= 3) $("progressMsg").textContent = "Can't reach the server. Retrying…"; return; }
+    if (currentJob !== id || finished) return; // the user opened another job meanwhile
+    if (r.status === 404) return showGone(id);
+    if (!r.ok) return;
+    failures = 0;
+    const job = await r.json();
+    if (currentJob !== id || finished) return;
+    if (!remembered) { remembered = true; rememberJob(id, job.repo); } // jobs opened by ID join the recent list
+    renderProgress(job);
+    if (!ACTIVE.includes(job.status)) {
+      finished = true;
+      clearInterval(pollTimer); $("cancel").classList.add("hidden");
+      rememberJob(id, job.repo);
+      renderRecent();
+      if (job.status === "done") { $("progress").classList.add("hidden"); renderResults(job); }
+    }
+  };
+  tick(); pollTimer = setInterval(tick, 700);
+  renderRecent();
+}
+
+// Coming back: reopen the job in the link, else the newest job of ours that's still running.
+(async () => {
+  const fromUrl = parseJobId(new URLSearchParams(location.search).get("job") || "");
+  if (fromUrl) { rememberJob(fromUrl); return startPolling(fromUrl); }
+  const recent = await renderRecent();
+  const running = recent.find(j => ACTIVE.includes(j.status));
+  if (running && !currentJob) startPolling(running.id);
+})();
+
+function renderProgress(job) {
+  const idx = PHASES.findIndex(([k]) => k === job.phase);
+  $("phases").innerHTML = PHASES.map(([k, name], i) =>
+    `<span class="phase ${i < idx || job.phase === "done" ? "done" : i === idx ? "active" : ""}">${name}</span>`).join("");
+  const within = job.pct || 0;
+  const overall = job.phase === "done" ? 1 : idx < 0 ? 0 : (idx + within) / PHASES.length;
+  $("fill").style.width = (overall * 100).toFixed(1) + "%";
+  $("progressMsg").textContent = job.message || "";
+  if (job.status === "error" || job.status === "cancelled") {
+    $("progressTitle").textContent = job.status === "error" ? "Analysis failed" : "Cancelled";
+    if (job.status === "error") {
+      $("jobError").className = "error";
+      $("jobError").innerHTML = esc(job.message) + (job.traceback ? `<details><summary>Details</summary><pre>${esc(job.traceback)}</pre></details>` : "");
+    }
+  }
+}
+
+function renderResults(job) {
+  const r = job.result, g = r.game, sp = r.self_play, op = r.opening, base = r.baseline;
+  const out = [];
+
+  out.push(`<section class="card">
+    <h2>${esc(g.name)}</h2>
+    <div class="chips" style="margin:0 0 16px">
+      <span class="chip">${g.num_players} player${g.num_players > 1 ? "s" : ""}</span>
+      <span class="chip">${g.perfect_information ? "Perfect information" : "Hidden information (IS-MCTS)"}</span>
+      ${g.has_rollout_policy ? '<span class="chip">Custom rollout policy</span>' : ""}
+      <span class="chip muted">${esc(job.repo)}</span>
+      <span class="chip muted" title="Open this report later with the link or the ID">Job <code>${esc(job.id)}</code></span>
+    </div>
+    ${r.aborted ? "" : `<div class="stats">
+      ${op ? `<div class="stat"><div class="v">${num(Math.round(op.iterations_per_second))}</div><div class="k">MCTS iterations / sec</div></div>` : ""}
+      ${sp ? `<div class="stat"><div class="v">${sp.games}</div><div class="k">self-play games</div></div>
+      <div class="stat"><div class="v">${sp.avg_length.toFixed(0)}</div><div class="k">avg actions per game (${sp.min_length}–${sp.max_length})</div></div>` : ""}
+      ${base ? `<div class="stat"><div class="v">${pct(base.mcts_avg_return)}</div><div class="k">MCTS score vs random players</div></div>` : ""}
+    </div>`}
+  </section>`);
+
+  if (r.insights?.length) {
+    out.push(`<section class="card"><h2>Findings</h2>
+      ${r.insights.map(i => `<div class="insight"><span class="tag ${i.kind}">${i.kind}</span><div>${md(i.text)}</div></div>`).join("")}
+    </section>`);
+  }
+
+  if (op) {
+    out.push(`<section class="card"><h2>Opening analysis</h2>
+      <p class="muted">${op.position ? esc(op.position) + " · " : ""}${num(op.iterations)} iterations in ${op.seconds.toFixed(1)}s${op.proven ? ` · position solved: ${badge(op.proven)}` : ""}</p>
+      <table><thead><tr><th>Move (player ${op.player})</th><th class="num">Win value</th><th class="barcell">Search effort</th><th class="num">Visits</th></tr></thead><tbody>
+      ${op.moves.map((m, i) => `<tr class="${i === 0 ? "best" : ""}"><td>${esc(m.action)}${badge(m.proven)}</td>
+        <td class="num">${pct(m.value, 1)}</td><td class="barcell">${bar(m.share)}</td><td class="num">${num(m.visits)}</td></tr>`).join("")}
+      </tbody></table>
+      ${op.principal_variation.length ? `<h3 style="margin-top:20px">Expected line of play</h3><div class="pv">
+        ${op.principal_variation.map((s, i) => `${i ? '<span class="arrow">→</span>' : ""}<span class="step ${s.player === "chance" ? "chance" : "p" + (s.player % 2)}" title="${s.player === "chance" ? "chance" : "player " + s.player}${s.value != null ? " · value " + pct(s.value) : ""}">${esc(s.action)}</span>`).join("")}
+      </div>` : ""}
+    </section>`);
+  }
+
+  if (sp) {
+    if (sp.policy.length) {
+      out.push(`<section class="card"><h2>Learned strategy</h2>
+        <p class="muted">What MCTS chose in each situation (grouped by the game's <code>strategy_key</code>) across self-play.</p>
+        <div class="scroll"><table><thead><tr><th>Situation</th><th>Best action</th><th class="barcell">Consistency</th><th class="num">Decisions</th><th>Also tried</th></tr></thead><tbody>
+        ${sp.policy.map(p => `<tr><td>${esc(p.situation)}${badge(p.solved)}</td><td><strong>${esc(p.best_action)}</strong></td>
+          <td class="barcell">${bar(p.confidence)}</td><td class="num">${p.samples}</td>
+          <td class="muted" style="font-size:13px">${p.others.map(o => `${esc(o.action)} (${o.count})`).join(", ")}</td></tr>`).join("")}
+        </tbody></table></div></section>`);
+    }
+
+    out.push(`<div class="two">
+      <section class="card"><h2>Action pick rates</h2>
+        <p class="muted">How often MCTS chose an action when it was legal. Near 0% suggests weak or dominated options.</p>
+        <div class="scroll"><table><thead><tr><th>Action</th><th class="barcell">Pick rate</th><th class="num">Chosen / legal</th></tr></thead><tbody>
+        ${[...sp.actions].sort((a, b) => b.pick_rate - a.pick_rate).map(a => `<tr><td>${esc(a.action)}</td><td class="barcell">${bar(a.pick_rate)}</td>
+          <td class="num">${a.chosen} / ${a.available}</td></tr>`).join("")}
+        </tbody></table></div>
+      </section>
+      <section class="card"><h2>Balance</h2>
+        <h3>Average result by seat (MCTS vs MCTS)</h3>
+        <table><tbody>${sp.seat_avg_return.map((v, i) => `<tr><td>Player ${i}</td><td class="barcell">${bar(v)}</td>
+          <td class="num">${pct(v)} <span class="muted">± ${pct(sp.seat_ci95[i])}</span></td></tr>`).join("")}</tbody></table>
+        ${base ? `<h3 style="margin-top:20px">Skill check (${base.games} games)</h3>
+        <table><tbody>
+          <tr><td>MCTS player</td><td class="barcell">${bar(base.mcts_avg_return)}</td><td class="num">${pct(base.mcts_avg_return)}</td></tr>
+          <tr><td>Random player</td><td class="barcell">${bar(base.random_avg_return)}</td><td class="num">${pct(base.random_avg_return)}</td></tr>
+        </tbody></table>` : ""}
+        ${sp.timeouts ? `<p class="warning" style="margin-top:14px">${sp.timeouts} game(s) hit the step cap.</p>` : ""}
+      </section>
+    </div>`);
+
+    if (sp.events.length) {
+      out.push(`<section class="card"><h2>Telemetry</h2><p class="muted">Events emitted by the game via <code>drain_events()</code> during self-play.</p>
+        <div class="scroll"><table><thead><tr><th>Event</th><th class="num">Total</th><th class="num">Per game</th></tr></thead><tbody>
+        ${sp.events.map(e => `<tr><td>${esc(e.event)}</td><td class="num">${num(e.count)}</td><td class="num">${e.per_game.toFixed(2)}</td></tr>`).join("")}
+        </tbody></table></div></section>`);
+    }
+
+    const sg = sp.sample_game;
+    if (sg?.moves?.length) {
+      out.push(`<section class="card"><details><summary style="margin:0">Sample self-play game (${sg.moves.length} moves · result ${sg.returns.map(v => pct(v)).join(" / ")}${sg.timed_out ? " · hit step cap" : ""})</summary>
+        <div class="scroll" style="margin-top:12px"><table class="transcript"><thead><tr><th>#</th><th>Player</th><th>Action</th><th class="num">Value</th><th>Alternatives considered</th></tr></thead><tbody>
+        ${sg.moves.map((m, i) => `<tr><td class="muted">${i + 1}</td><td>${m.player === "chance" ? '<span class="muted">chance</span>' : "P" + m.player}</td>
+          <td>${m.position ? `<div class="pos">${esc(m.position)}</div>` : ""}${m.player === "chance" ? `<em>${esc(m.action)}</em>` : `<strong>${esc(m.action)}</strong>`}</td>
+          <td class="num">${m.value != null ? pct(m.value) : ""}</td>
+          <td class="muted" style="font-size:12px">${(m.alternatives || []).map(a => `${esc(a.action)} ${pct(a.value)}`).join(" · ")}</td></tr>`).join("")}
+        </tbody></table></div>
+        ${sg.final ? `<p class="muted" style="margin-top:10px">Final: ${esc(sg.final)}</p>` : ""}
+      </details></section>`);
+    }
+  }
+
+  out.push(`<section class="card"><h2>Conformance checks</h2>
+    ${r.validation.map(v => `<div class="check"><span class="icon ${v.severity === "error" ? "err" : v.severity}">${v.severity === "ok" ? "✓" : v.severity === "warning" ? "!" : "✕"}</span><span>${esc(v.message)}</span></div>`).join("")}
+    <div class="chips"><button class="secondary" type="button" id="dl">Download raw JSON</button></div>
+  </section>`);
+
+  $("results").innerHTML = out.join("");
+  $("dl").onclick = () => {
+    const blob = new Blob([JSON.stringify(r, null, 2)], { type: "application/json" });
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: `metafinder-${job.id}.json` });
+    a.click();
+  };
+}
+</script>
+</body>
+</html>

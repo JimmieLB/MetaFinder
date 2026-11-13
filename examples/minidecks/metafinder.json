@@ -1,0 +1,4 @@
+{
+  "entry": "minidecks:GAME",
+  "config": { "max_hp": 15, "hand_size": 4, "max_turns": 60 }
+}
