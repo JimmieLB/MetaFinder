@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -39,6 +40,12 @@ PASSWORD = os.environ.get("METAFINDER_PASSWORD", "")
 WORKER_USER = os.environ.get("METAFINDER_WORKER_USER", "")
 WORKER_MEMORY_MB = int(os.environ.get("METAFINDER_WORKER_MEMORY_MB", 1536))
 POSIX = os.name == "posix"
+# AI training (tune.mjs) runs games on several threads and gets its own, usually longer, time limit.
+# A run that reaches it stops cleanly and its progress can be resumed later.
+TUNE_TIMEOUT = int(os.environ.get("METAFINDER_TUNE_TIMEOUT", JOB_TIMEOUT))
+TUNE_THREADS = int(os.environ.get("METAFINDER_TUNE_THREADS", 0))  # 0 = CPU cores − 1
+MAX_DOWNLOAD_MB = int(os.environ.get("METAFINDER_MAX_DOWNLOAD_MB", 200))  # cap on the game folder zipped for download
+CHECKPOINT = "metafinder.tuned.json"
 
 GITHUB_RE = re.compile(
     r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?"
@@ -79,6 +86,26 @@ class AnalyzeRequest(BaseModel):
     rollout_depth: int | None = Field(None, ge=1, le=100_000)
     seed: int = 1
     config: dict = Field(default_factory=dict)
+
+
+class TuneRequest(BaseModel):
+    repo_url: str = Field(..., max_length=500)
+    rounds: int = Field(20, ge=1, le=2000, description="Training rounds in this run (on top of any saved progress)")
+    games: int | None = Field(None, ge=2, le=1000, description="Games per round (default: one per thread)")
+    iterations: int = Field(150, ge=10, le=50_000, description="MCTS iterations per move while training")
+    exploration: float = Field(0.7, gt=0, le=5)
+    config: dict = Field(default_factory=dict)
+    checkpoint: dict | None = Field(None, description="Saved training progress (a metafinder.tuned.json) to resume")
+
+
+def tune_threads() -> int:
+    if TUNE_THREADS > 0:
+        return TUNE_THREADS
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpus = os.cpu_count() or 2
+    return max(1, cpus - 1)
 
 
 def parse_source(url: str) -> dict:
@@ -136,23 +163,47 @@ def detect_runtime(repo_dir: Path) -> str:
     return "python"
 
 
+def node_binary() -> str:
+    node = os.environ.get("METAFINDER_NODE") or shutil.which("node")
+    if not node:
+        raise RuntimeError("This game is a Node.js module, but Node.js isn't installed on the MetaFinder host "
+                           "(install Node 20+ or set METAFINDER_NODE to its path)")
+    return node
+
+
 def worker_command(runtime: str, repo_dir: Path, params_path: Path) -> list[str]:
     if runtime == "node":
-        node = os.environ.get("METAFINDER_NODE") or shutil.which("node")
-        if not node:
-            raise RuntimeError("This game is a Node.js module, but Node.js isn't installed on the MetaFinder host "
-                               "(install Node 20+ or set METAFINDER_NODE to its path)")
-        cmd = [node, f"--max-old-space-size={WORKER_MEMORY_MB}", str(ROOT / "metafinder" / "node" / "worker.mjs"),
-               "--repo", str(repo_dir), "--params", str(params_path)]
+        cmd = [node_binary(), f"--max-old-space-size={WORKER_MEMORY_MB}",
+               str(ROOT / "metafinder" / "node" / "worker.mjs"), "--repo", str(repo_dir), "--params", str(params_path)]
     else:
         cmd = [sys.executable, "-m", "metafinder.worker", "--repo", str(repo_dir), "--params", str(params_path)]
+    return limited(cmd, runtime, JOB_TIMEOUT + 60)
+
+
+def tune_command(repo_dir: Path, out_path: Path, params: dict, resume: bool) -> list[str]:
+    threads = tune_threads()
+    cmd = [node_binary(), f"--max-old-space-size={WORKER_MEMORY_MB}", str(ROOT / "metafinder" / "node" / "tune.mjs"),
+           "--repo", str(repo_dir), "--out", str(out_path), "--jsonl", "--threads", str(threads),
+           "--iterations", str(params["iterations"]), "--exploration", str(params["exploration"]),
+           # Stop early enough to finish cleanly (and save) before the hard kill.
+           "--time-limit", str(max(30, TUNE_TIMEOUT - 30))]
+    cmd += ["--resume", "--more-rounds", str(params["rounds"])] if resume else ["--rounds", str(params["rounds"])]
+    if params.get("games"):
+        cmd += ["--games", str(params["games"])]
+    if params.get("config"):
+        cmd += ["--config", json.dumps(params["config"])]
+    # CPU time is counted across all threads.
+    return limited(cmd, "node", (TUNE_TIMEOUT + 60) * (threads + 1))
+
+
+def limited(cmd: list[str], runtime: str, cpu_seconds: int) -> list[str]:
     bash = shutil.which("bash") if POSIX else None
     if bash:
         # Resource limits for the submitted code: CPU seconds, file size (KB) and (Python only; V8 reserves
         # far more address space than it uses) memory. No process limit (ulimit -u): Linux counts it per
         # user ID across the whole host, so on shared container hosts it's already used up by other
         # containers and Node can't even start its threads. The container's own pids limit covers that.
-        limits = f"ulimit -t {JOB_TIMEOUT + 60} && ulimit -f 262144"
+        limits = f"ulimit -t {cpu_seconds} && ulimit -f 262144"
         if runtime != "node":
             limits += f" && ulimit -v {WORKER_MEMORY_MB * 1024}"
         cmd = [bash, "-c", f'{limits} && exec "$@"', "metafinder-worker", *cmd]
@@ -185,107 +236,281 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
-def _run_job(job_id: str, source: dict, params: dict) -> None:
+def _fetch(job_id: str, source: dict, job_dir: Path) -> Path:
+    """Clones a GitHub source into job_dir/repo (or returns the local folder). Returns the game folder."""
+    if source["kind"] != "github":
+        return Path(source["path"])
+    _update(job_id, status="cloning", phase="clone", message=f"Cloning {source['clone_url']}")
+    dest = job_dir / "repo"
+    cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags"]
+    if source["ref"]:
+        cmd += ["--branch", source["ref"]]
+    cmd += [source["clone_url"], str(dest)]
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+    if r.returncode != 0:
+        raise RuntimeError("git clone failed: " + (r.stderr.strip().splitlines() or ["unknown error"])[-1])
+    repo_dir = (dest / source["subdir"]).resolve()
+    if dest.resolve() not in [repo_dir, *repo_dir.parents] or not repo_dir.is_dir():
+        raise RuntimeError(f"Sub-directory '{source['subdir']}' not found in the repository")
+    return repo_dir
+
+
+def _stream(job_id: str, cmd: list[str], job_dir: Path, timeout: int, done_message: str) -> None:
+    """Runs a worker that speaks the JSON-lines protocol and mirrors its progress into the job."""
+    with open(job_dir / "worker.log", "w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(job_dir), env=worker_env(), stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8",
+            start_new_session=POSIX, **worker_user_kwargs(),
+        )
+        _procs[job_id] = proc
+        timed_out = threading.Event()
+        killer = threading.Timer(timeout, lambda: (timed_out.set(), _kill(proc)))
+        killer.start()
+        got_result = False
+        try:
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("type") == "progress":
+                    _update(job_id, phase=msg.get("phase"), pct=msg.get("pct", 0), message=msg.get("message", ""))
+                elif msg.get("type") == "result":
+                    got_result = True
+                    _update(job_id, status="done", phase="done", pct=1, message=done_message,
+                            result=msg, finished=time.time())
+                elif msg.get("type") == "error":
+                    got_result = True
+                    _update(job_id, status="error", message=msg.get("message", "Error"),
+                            traceback=msg.get("traceback"), finished=time.time())
+            proc.wait()
+        finally:
+            killer.cancel()
+            if POSIX:
+                _kill(proc)  # anything the game code left running in the worker's process group
+            _procs.pop(job_id, None)
+
+    if _jobs[job_id]["status"] == "cancelled" or got_result:
+        return
+    tail = (job_dir / "worker.log").read_text(encoding="utf-8", errors="replace")[-2000:]
+    reason = f"timed out after {timeout}s; try a smaller budget" if timed_out.is_set() \
+        else f"exited with code {proc.returncode}"
+    _update(job_id, status="error", message=f"Worker {reason}", traceback=tail, finished=time.time())
+
+
+def _run_job(job_id: str, source: dict, params: dict, kind: str = "analyze", checkpoint: dict | None = None) -> None:
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     _update(job_id, status="queued", message="Waiting for a free worker slot")
     with _slots:
         if _jobs[job_id]["status"] == "cancelled":
             return
+        repo_dir = None
         try:
-            # ---- fetch
-            if source["kind"] == "github":
-                _update(job_id, status="cloning", phase="clone", message=f"Cloning {source['clone_url']}")
-                dest = job_dir / "repo"
-                cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags"]
-                if source["ref"]:
-                    cmd += ["--branch", source["ref"]]
-                cmd += [source["clone_url"], str(dest)]
-                env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
-                if r.returncode != 0:
-                    raise RuntimeError("git clone failed: " + (r.stderr.strip().splitlines() or ["unknown error"])[-1])
-                repo_dir = (dest / source["subdir"]).resolve()
-                if dest.resolve() not in [repo_dir, *repo_dir.parents] or not repo_dir.is_dir():
-                    raise RuntimeError(f"Sub-directory '{source['subdir']}' not found in the repository")
-            else:
-                repo_dir = Path(source["path"])
-
-            # ---- analyze
-            params_path = job_dir / "params.json"
-            # The worker paces itself to finish (with partial results if need be) before the hard kill.
-            worker_params = {**params, "time_budget": max(30, JOB_TIMEOUT - 20)}
-            params_path.write_text(json.dumps(worker_params), encoding="utf-8")
-            env = worker_env()
+            repo_dir = _fetch(job_id, source, job_dir)
             runtime = detect_runtime(repo_dir)
-            cmd = worker_command(runtime, repo_dir, params_path)
-            _update(job_id, status="running", phase="load", runtime=runtime,
-                    message=f"Starting analysis worker ({'Node.js' if runtime == 'node' else 'Python'})")
-            with open(job_dir / "worker.log", "w", encoding="utf-8") as log:
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(job_dir), env=env, stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8",
-                    start_new_session=POSIX, **worker_user_kwargs(),
-                )
-                _procs[job_id] = proc
-                timed_out = threading.Event()
-                killer = threading.Timer(JOB_TIMEOUT, lambda: (timed_out.set(), _kill(proc)))
-                killer.start()
-                got_result = False
-                try:
-                    for line in proc.stdout:
-                        try:
-                            msg = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if msg["type"] == "progress":
-                            _update(job_id, phase=msg["phase"], pct=msg["pct"], message=msg["message"])
-                        elif msg["type"] == "result":
-                            got_result = True
-                            _update(job_id, status="done", phase="done", pct=1, message="Analysis complete",
-                                    result=msg, finished=time.time())
-                        elif msg["type"] == "error":
-                            got_result = True
-                            _update(job_id, status="error", message=msg["message"], traceback=msg.get("traceback"),
-                                    finished=time.time())
-                    proc.wait()
-                finally:
-                    killer.cancel()
-                    if POSIX:
-                        _kill(proc)  # anything the game code left running in the worker's process group
-                    _procs.pop(job_id, None)
-
-            if _jobs[job_id]["status"] == "cancelled":
-                return
-            if not got_result:
-                tail = (job_dir / "worker.log").read_text(encoding="utf-8", errors="replace")[-2000:]
-                reason = f"timed out after {JOB_TIMEOUT}s; try a smaller budget" if timed_out.is_set() \
-                    else f"exited with code {proc.returncode}"
-                _update(job_id, status="error", message=f"Analysis worker {reason}", traceback=tail,
-                        finished=time.time())
+            if kind == "tune":
+                _run_tune(job_id, job_dir, repo_dir, runtime, params, checkpoint)
+            else:
+                params_path = job_dir / "params.json"
+                # The worker paces itself to finish (with partial results if need be) before the hard kill.
+                worker_params = {**params, "time_budget": max(30, JOB_TIMEOUT - 20)}
+                params_path.write_text(json.dumps(worker_params), encoding="utf-8")
+                cmd = worker_command(runtime, repo_dir, params_path)
+                _update(job_id, status="running", phase="load", runtime=runtime,
+                        message=f"Starting analysis worker ({'Node.js' if runtime == 'node' else 'Python'})")
+                _stream(job_id, cmd, job_dir, JOB_TIMEOUT, "Analysis complete")
         except subprocess.TimeoutExpired:
             _update(job_id, status="error", message="git clone timed out", finished=time.time())
         except Exception as e:
             _update(job_id, status="error", message=str(e), finished=time.time())
         finally:
+            if kind == "tune" and repo_dir is not None:
+                try:
+                    _collect_training(job_id, job_dir, repo_dir)
+                except Exception as e:  # never lose the job's own status over the downloads
+                    _update(job_id, downloads_error=f"Could not prepare the downloads: {e}")
             if source["kind"] == "github" and (job_dir / "repo").exists():
                 try:
                     _rmtree(job_dir / "repo")
                 except OSError:
                     pass
+            if kind == "tune":
+                _update(job_id, finalized=True)  # downloads (if any) are ready
+
+
+# --------------------------------------------------------------------------- AI training
+def _run_tune(job_id: str, job_dir: Path, repo_dir: Path, runtime: str, params: dict, checkpoint: dict | None) -> None:
+    if runtime != "node":
+        raise RuntimeError("AI training is only available for JavaScript (Node.js) game modules for now. "
+                           "Analysis works for both.")
+    # The worker writes its checkpoint here. It gets its own folder because the worker may run as another user.
+    out_dir = job_dir / "train"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / CHECKPOINT
+    if checkpoint is not None:
+        out_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    if worker_user_kwargs():
+        shutil.chown(out_dir, WORKER_USER, WORKER_USER)
+        if out_path.exists():
+            shutil.chown(out_path, WORKER_USER, WORKER_USER)
+    cmd = tune_command(repo_dir, out_path, params, resume=checkpoint is not None)
+    _update(job_id, status="running", phase="load", runtime=runtime,
+            message=f"Starting AI training on {tune_threads()} thread(s)")
+    _stream(job_id, cmd, job_dir, TUNE_TIMEOUT, "Training complete")
+
+
+def _get_path(obj, dotted: str):
+    for k in dotted.split("."):
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(k)
+    return obj
+
+
+def _set_path(obj: dict, dotted: str, value) -> None:
+    keys = dotted.split(".")
+    for k in keys[:-1]:
+        if not isinstance(obj.get(k), dict):
+            obj[k] = {}
+        obj = obj[k]
+    obj[keys[-1]] = value
+
+
+def _read_checkpoint(path: Path) -> dict | None:
+    """Reads the worker-written checkpoint defensively: a regular file (not a link), small, valid JSON."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 20 * 1024 * 1024:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("params"), list) or not isinstance(data.get("round"), int):
+        return None
+    return data
+
+
+def _collect_training(job_id: str, job_dir: Path, repo_dir: Path) -> None:
+    """After a training run (finished, stopped, cancelled or failed): keeps the latest checkpoint for download
+    and zips the game with the best AI values written into its metafinder.json."""
+    ck = _read_checkpoint(job_dir / "train" / CHECKPOINT)
+    # Only progress made by this run counts (an uploaded checkpoint that was rejected must not end up in a zip).
+    if ck is None or ck["round"] <= (_jobs[job_id].get("resumed_from") or 0):
+        return
+    (job_dir / "checkpoint.json").write_text(json.dumps(ck, indent=2) + "\n", encoding="utf-8")
+
+    params = [p for p in ck["params"] if isinstance(p, dict) and isinstance(p.get("path"), str)]
+    check = ck.get("check") if isinstance(ck.get("check"), dict) else None
+    result = _jobs[job_id].get("result") or {}
+    n_players = (result.get("game") or {}).get("num_players")
+    # The tuned values are the best estimate, unless the final check found them no better than where we started.
+    worse = check is not None and n_players and check.get("score", 1) <= 1 / n_players
+    use = "start" if worse else "tuned"
+    summary = {"round": ck["round"], "rounds": ck.get("rounds"), "check": check,
+               "stopped_early": bool(ck.get("stopped_early")), "params": params, "game_values": use}
+    _update(job_id, training=summary, downloads={"checkpoint": True, "game": False})
+
+    manifest_path = repo_dir / "metafinder.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"metafinder.json could not be read: {e}") from e
+    manifest.setdefault("config", {})
+    for p in params:
+        value = p.get(use)
+        if isinstance(value, (int, float)) and value > 0:
+            _set_path(manifest["config"], p["path"], value)
+
+    files, total = [], 0
+    root = repo_dir.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):  # does not follow directory links
+        dirnames[:] = [d for d in dirnames if d != ".git" and not os.path.islink(os.path.join(dirpath, d))]
+        for name in filenames:
+            full = Path(dirpath) / name
+            rel = full.relative_to(root).as_posix()
+            if rel in ("metafinder.json", CHECKPOINT):
+                continue
+            st = full.lstat()
+            if not stat.S_ISREG(st.st_mode):  # skip links: they could point outside the game folder
+                continue
+            total += st.st_size
+            files.append((full, rel))
+    if total > MAX_DOWNLOAD_MB * 1024 * 1024:
+        _update(job_id, downloads_error=f"The game folder is over {MAX_DOWNLOAD_MB} MB, so it wasn't zipped. "
+                                        "Download the training progress and copy its values into metafinder.json.")
+        return
+
+    top = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(_jobs[job_id]["repo"].rstrip("/")).name or "game").strip("-.") or "game"
+    tmp = job_dir / "game.zip.tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        for full, rel in files:
+            z.write(full, f"{top}/{rel}")
+        z.writestr(f"{top}/metafinder.json", json.dumps(manifest, indent=2) + "\n")
+        z.writestr(f"{top}/{CHECKPOINT}", json.dumps(ck, indent=2) + "\n")
+    tmp.replace(job_dir / "game.zip")
+    _update(job_id, downloads={"checkpoint": True, "game": True, "name": top})
 
 
 # --------------------------------------------------------------------------- routes
+def _start(source: dict, params: dict, kind: str, checkpoint: dict | None = None) -> dict:
+    job_id = uuid.uuid4().hex[:12]
+    with _lock:
+        _jobs[job_id] = {"id": job_id, "kind": kind, "repo": source["display"], "status": "queued", "phase": "queue",
+                         "pct": 0.0, "message": "Queued", "created": time.time(), "params": params,
+                         "resumed_from": checkpoint.get("round") if checkpoint else None}
+    threading.Thread(target=_run_job, args=(job_id, source, params, kind, checkpoint), daemon=True).start()
+    return {"id": job_id}
+
+
 @app.post("/api/jobs")
 def create_job(req: AnalyzeRequest):
     source = parse_source(req.repo_url)
-    job_id = uuid.uuid4().hex[:12]
-    params = req.model_dump(exclude={"repo_url"})
-    with _lock:
-        _jobs[job_id] = {"id": job_id, "repo": source["display"], "status": "queued", "phase": "queue",
-                         "pct": 0.0, "message": "Queued", "created": time.time(), "params": params}
-    threading.Thread(target=_run_job, args=(job_id, source, params), daemon=True).start()
-    return {"id": job_id}
+    return _start(source, req.model_dump(exclude={"repo_url"}), "analyze")
+
+
+@app.post("/api/tune")
+def create_tune_job(req: TuneRequest):
+    source = parse_source(req.repo_url)
+    ck = req.checkpoint
+    if ck is not None:
+        if len(json.dumps(ck)) > 20 * 1024 * 1024:
+            raise HTTPException(400, "The saved progress file is too large")
+        if not isinstance(ck.get("params"), list) or not isinstance(ck.get("theta"), list) \
+                or not isinstance(ck.get("round"), int):
+            raise HTTPException(400, f"That file isn't saved training progress (a {CHECKPOINT} from a training run)")
+    return _start(source, req.model_dump(exclude={"repo_url", "checkpoint"}), "tune", ck)
+
+
+def _job_file(job_id: str, name: str) -> Path:
+    if job_id not in _jobs:
+        raise HTTPException(404, "Unknown job")
+    path = JOBS_DIR / job_id / name
+    if not path.is_file():
+        raise HTTPException(404, "Nothing to download yet")
+    return path
+
+
+@app.get("/api/jobs/{job_id}/checkpoint")
+def download_checkpoint(job_id: str):
+    """The training progress: upload it to a new training run to continue where this one stopped."""
+    name = (_jobs[job_id].get("downloads") or {}).get("name", "game") if job_id in _jobs else "game"
+    return FileResponse(_job_file(job_id, "checkpoint.json"), media_type="application/json",
+                        filename=f"{name}.{CHECKPOINT}")
+
+
+@app.get("/api/jobs/{job_id}/game.zip")
+def download_game(job_id: str):
+    """The game folder with the best AI values in metafinder.json (and the training progress alongside)."""
+    name = (_jobs[job_id].get("downloads") or {}).get("name", "game") if job_id in _jobs else "game"
+    return FileResponse(_job_file(job_id, "game.zip"), media_type="application/zip", filename=f"{name}-trained-ai.zip")
 
 
 @app.get("/api/jobs/{job_id}")

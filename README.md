@@ -275,7 +275,8 @@ Each round nudges every tuned value up or down at random, plays the "+" and "−
 (seats swapped, games spread over all CPU cores), and moves the values toward the side that scored better
 (SPSA). Finally the tuned values play the starting values, and `--write` saves them only if they win clearly.
 The next run starts from the saved values. Progress is checkpointed to `metafinder.tuned.json` after every round,
-so `--resume` continues an interrupted run.
+so `--resume` continues an interrupted run (`--more-rounds N` trains N rounds past the checkpoint). `--time-limit S`
+stops starting new rounds so the run, final check included, ends within about S seconds.
 
 It needs two things from the module:
 
@@ -292,6 +293,25 @@ defaults), or `--referee '{…}'`. A fixed referee stops the tuner from just agr
 iterations per move by default (`--iterations`). Values tuned for weak search may not carry over to much stronger
 search, so tune near the iteration count you analyse with if you have the time.
 
+### Training from the web page
+
+**Train AI** (next to Analyze) runs the same tuner on the server for the repository in the box. Rounds, iterations
+per move and games per round are under **AI training**. A run saves its progress after every round and stops
+cleanly before `METAFINDER_TUNE_TIMEOUT` (default: the analysis timeout). When it finishes, hits the limit or is
+cancelled, the page offers two downloads:
+
+- **Save training progress (.json)**: the `metafinder.tuned.json` checkpoint. Choose it under **AI training →
+  Continue from saved progress** and press Train AI again to run that many more rounds from where it stopped.
+  It must come from the same game and the same `"tune"` list.
+- **Download game with best AI (.zip)**: the game folder (without `.git`) with the best values written into
+  `metafinder.json`'s `config`, plus the checkpoint. "Best" means the tuned values, unless the final
+  tuned-vs-start check found them no better, in which case the starting values are kept. With the checkpoint
+  inside, `tune.mjs --repo <unzipped folder> --resume --more-rounds N` continues training locally too.
+
+Downloads live in the server's job folder, so they are lost on a restart or redeploy: save them when a run ends.
+`METAFINDER_TUNE_THREADS` sets the threads per run (default: CPU cores − 1).
+
+## How it works
 
 - `metafinder/mcts.py`: single-observer IS-MCTS with chance nodes. Perfect-information games also get an
   MCTS-Solver, which propagates proven wins and losses up the tree.
@@ -308,7 +328,8 @@ search, so tune near the iteration count you analyse with if you have the time.
 
 Settings are environment variables: `METAFINDER_JOB_TIMEOUT` (seconds, default 900), `METAFINDER_MAX_CONCURRENT`
 (default 2), `METAFINDER_ALLOW_LOCAL` (default `1`: accepts local paths and shows the example buttons),
-`METAFINDER_JOBS_DIR` and `METAFINDER_NODE`. To keep them in a file, copy [example.env](example.env) to `.env`.
+`METAFINDER_JOBS_DIR`, `METAFINDER_NODE`, and for AI training `METAFINDER_TUNE_TIMEOUT`, `METAFINDER_TUNE_THREADS` and
+`METAFINDER_MAX_DOWNLOAD_MB`. To keep them in a file, copy [example.env](example.env) to `.env`.
 `python -m metafinder` reads it at startup, or another file passed with `--env-file`. Variables already set in the
 environment take priority.
 

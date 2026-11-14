@@ -40,6 +40,10 @@ const HELP = `Tunes a game's AI-scoring values by self-play.
   --resume            continue from the checkpoint in --out
   --write             save the tuned values into metafinder.json if they beat the start clearly
   --seed N            random seed (default: time-based)
+  --more-rounds N     with --resume: train N rounds beyond the checkpoint (instead of up to --rounds)
+  --time-limit S      stop starting new rounds so the run, final check included, ends within about
+                      S seconds; the checkpoint keeps the progress for --resume
+  --jsonl             machine-readable progress on stdout, one JSON object per line (used by the web app)
 `;
 
 // ---------------------------------------------------------------------------- args
@@ -73,6 +77,9 @@ function parseArgs(argv) {
     else if (a === "--resume") o.resume = true;
     else if (a === "--write") o.write = true;
     else if (a === "--seed") o.seed = num(v(), a);
+    else if (a === "--more-rounds") o.moreRounds = num(v(), a);
+    else if (a === "--time-limit") o.timeLimit = num(v(), a);
+    else if (a === "--jsonl") JSONL = true;
     else fail(`Unknown option ${a} (see --help)`);
   }
   if (!o.repo) fail("--repo is required (see --help)");
@@ -87,7 +94,14 @@ function parseJson(text, name) {
   }
 }
 
+// --jsonl: stdout carries only protocol lines ({"type": "progress" | "result" | "error", ...}) and the
+// human-readable log goes to stderr.
+let JSONL = process.argv.includes("--jsonl");
+const emit = (obj) => JSONL && process.stdout.write(JSON.stringify(obj) + "\n");
+const progress = (phase, pct, message) => emit({ type: "progress", phase, pct: Math.round(pct * 1000) / 1000, message });
+
 function fail(msg) {
+  emit({ type: "error", message: msg });
   process.stderr.write(`tune: ${msg}\n`);
   process.exit(2);
 }
@@ -201,13 +215,19 @@ const stderr = (xs) => {
   return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1) / xs.length);
 };
 const fmtTime = (s) => (s >= 3600 ? `${(s / 3600).toFixed(1)}h` : s >= 60 ? `${Math.round(s / 60)}m` : `${Math.round(s)}s`);
-const log = (msg) => process.stdout.write(msg + "\n");
+const log = (msg) => (JSONL ? process.stderr : process.stdout).write(msg + "\n");
 
 // ---------------------------------------------------------------------------- main
 async function main() {
   const o = parseArgs(process.argv.slice(2));
   const repo = path.resolve(o.repo);
-  const [game, manifestConfig, manifest] = await loadGame(repo);
+  progress("load", 0, "Importing game module");
+  let game, manifestConfig, manifest;
+  try {
+    [game, manifestConfig, manifest] = await loadGame(repo);
+  } catch (e) {
+    fail(e?.message || String(e));
+  }
   if (manifest.runtime && manifest.runtime !== "node") fail("The tuner only supports JavaScript (runtime \"node\") modules for now");
 
   const base = { ...structuredClone(manifestConfig), ...(o.config ?? {}) };
@@ -228,7 +248,7 @@ async function main() {
   let games = Math.max(n, Math.floor(o.games ?? threads));
   games -= games % n; // every config plays every seat equally often
   const checkGames = Math.max(n, Math.floor(o.checkGames ?? games * 2) - (Math.floor(o.checkGames ?? games * 2) % n));
-  const rounds = Math.max(1, Math.floor(o.rounds ?? 30));
+  let rounds = Math.max(1, Math.floor(o.rounds ?? 30));
   const iterations = Math.max(1, Math.floor(o.iterations ?? 150));
   const maxSteps = Number.parseInt(game.maxSteps ?? 500, 10);
   const ctx = {
@@ -238,6 +258,36 @@ async function main() {
   };
   const outFile = path.resolve(o.out ?? path.join(repo, "metafinder.tuned.json"));
 
+  let theta = specs.map((s) => Math.log(s.start));
+  let startRound = 0;
+  let history = [];
+  let seed = Math.floor(o.seed ?? Date.now() % 1e9);
+  if (o.resume) {
+    if (!fs.existsSync(outFile)) fail(`--resume: no checkpoint at ${outFile}`);
+    let ck;
+    try {
+      ck = JSON.parse(fs.readFileSync(outFile, "utf8"));
+    } catch (e) {
+      fail(`--resume: the checkpoint is not valid JSON (${e.message})`);
+    }
+    const same = JSON.stringify(ck.params?.map((p) => p.path)) === JSON.stringify(specs.map((s) => s.path));
+    if (!same) fail("--resume: the checkpoint tuned different values; drop --resume or use the same --param list");
+    const ok = Array.isArray(ck.theta) && ck.theta.length === specs.length && ck.theta.every(Number.isFinite) &&
+      Number.isInteger(ck.round) && ck.round >= 0 && Number.isFinite(ck.seed);
+    if (!ok) fail("--resume: the checkpoint is incomplete or damaged");
+    theta = ck.theta;
+    startRound = ck.round;
+    history = ck.history ?? [];
+    seed = ck.seed;
+    for (const [i, s] of specs.entries()) {
+      // Keep the original starting point and bounds, even if metafinder.json now holds tuned values.
+      const p = ck.params[i];
+      if (p.start > 0) s.start = p.start;
+      if (p.min > 0 && p.max >= p.min) [s.min, s.max] = [p.min, p.max];
+    }
+    if (o.moreRounds) rounds = startRound + Math.max(1, Math.floor(o.moreRounds));
+  }
+
   // SPSA in log space. c: perturbation size, a: step size, both shrinking over the run.
   const c0 = Math.log(1.2); // try ±20% at first
   const A = Math.max(1, rounds / 10);
@@ -246,22 +296,7 @@ async function main() {
   const lo = specs.map((s) => Math.log(s.min));
   const hi = specs.map((s) => Math.log(s.max));
   const clamp = (t) => t.map((x, i) => Math.min(hi[i], Math.max(lo[i], x)));
-
-  let theta = specs.map((s) => Math.log(s.start));
-  let startRound = 0;
-  let history = [];
-  let seed = Math.floor(o.seed ?? Date.now() % 1e9);
-  if (o.resume) {
-    if (!fs.existsSync(outFile)) fail(`--resume: no checkpoint at ${outFile}`);
-    const ck = JSON.parse(fs.readFileSync(outFile, "utf8"));
-    const same = JSON.stringify(ck.params?.map((p) => p.path)) === JSON.stringify(specs.map((s) => s.path));
-    if (!same) fail("--resume: the checkpoint tuned different values; drop --resume or use the same --param list");
-    theta = ck.theta;
-    startRound = ck.round;
-    history = ck.history ?? [];
-    seed = ck.seed;
-    for (const [i, s] of specs.entries()) s.start = ck.params[i].start;
-  }
+  theta = clamp(theta);
   const rand = mulberry32(seed + startRound * 7777);
 
   const save = (extra = {}) => {
@@ -282,14 +317,32 @@ async function main() {
     return tuned;
   };
 
+  if (startRound >= rounds) {
+    fail(`The saved progress is already at round ${startRound} of ${rounds}. Ask for more rounds to keep training` +
+      (JSONL ? "." : " (--rounds or --more-rounds)."));
+  }
   log(`Tuning ${game.name}: ${specs.map((s) => s.path).join(", ")}`);
   log(`${rounds - startRound} rounds × ${games} games at ${iterations} iterations/move on ${threads} threads; ` +
     `then ${checkGames} games tuned vs start. Checkpoint: ${outFile}`);
 
   const pool = new Pool(repo, threads);
   const t0 = performance.now() / 1000;
+  const elapsedS = () => performance.now() / 1000 - t0;
+  const checkRounds = checkGames / games; // the final check costs about this many rounds
+  const valuesText = (cfg) => specs.map((s) => `${s.path}=${getPath(cfg, s.path)}`).join("  ");
+  let lastRound = startRound;
+  let stoppedEarly = false;
+  progress("train", 0, `Round ${startRound + 1}/${rounds}…`);
   try {
     for (let k = startRound; k < rounds; k += 1) {
+      if (o.timeLimit && k > startRound) {
+        const perRound = elapsedS() / (k - startRound);
+        if (elapsedS() + perRound * (1 + checkRounds) > o.timeLimit) {
+          stoppedEarly = true;
+          log(`Time limit: stopping after round ${k}/${rounds}. The checkpoint is saved; --resume continues from there.`);
+          break;
+        }
+      }
       const ck = c0 / (k + 1) ** 0.101;
       const ak = a0 / (k + 1 + A) ** 0.602;
       const delta = specs.map(() => (rand() < 0.5 ? -1 : 1));
@@ -301,29 +354,42 @@ async function main() {
       theta = clamp(theta.map((t, i) => t + Math.max(-maxStep, Math.min(maxStep, (ak * r * delta[i]) / ck))));
       history.push({ round: k + 1, plus_score: Math.round(score * 1000) / 1000, theta: theta.map((t) => Math.round(t * 1e4) / 1e4) });
       const tuned = save({ round: k + 1 });
+      lastRound = k + 1;
 
-      const elapsed = performance.now() / 1000 - t0;
+      const elapsed = elapsedS();
       const eta = (elapsed / (k + 1 - startRound)) * (rounds - k - 1);
-      const values = specs.map((s) => `${s.path}=${getPath(tuned, s.path)}`).join("  ");
+      const values = valuesText(tuned);
       log(`round ${String(k + 1).padStart(3)}/${rounds}  "+" scored ${(score * 100).toFixed(1)}%  ${values}  (${fmtTime(elapsed)}, ~${fmtTime(eta)} left)`);
+      progress("train", (k + 1 - startRound) / (rounds - startRound), `Round ${k + 1}/${rounds} · ${values} · ~${fmtTime(eta)} left`);
     }
 
-    // Check: tuned values against the starting values.
+    // Check: tuned values against the starting values (skipped if it wouldn't fit in the time limit).
     const startTheta = specs.map((s) => Math.log(s.start));
     const tuned = configFor(base, specs, theta);
     const startCfg = configFor(base, specs, startTheta);
-    log(`Checking: ${checkGames} games, tuned vs starting values…`);
-    const res = await duel(pool, ctx, tuned, startCfg, checkGames, seed + 9_000_000);
-    const scores = res.map((r) => r.score);
-    const m = mean(scores);
-    const ci = 1.96 * stderr(scores);
-    const better = m - ci > 1 / n;
-    const check = { games: checkGames, score: Math.round(m * 1000) / 1000, ci95: Math.round(ci * 1000) / 1000, better };
-    save({ round: rounds, check });
+    const perRound = elapsedS() / Math.max(1, lastRound - startRound);
+    let check = null;
+    if (o.timeLimit && elapsedS() + perRound * checkRounds > o.timeLimit) {
+      log("Time limit: skipped the tuned-vs-start check.");
+    } else {
+      log(`Checking: ${checkGames} games, tuned vs starting values…`);
+      progress("check", 0, `Checking: ${checkGames} games, tuned vs starting values`);
+      const res = await duel(pool, ctx, tuned, startCfg, checkGames, seed + 9_000_000);
+      const scores = res.map((r) => r.score);
+      const m = mean(scores);
+      const ci = 1.96 * stderr(scores);
+      check = { games: checkGames, score: Math.round(m * 1000) / 1000, ci95: Math.round(ci * 1000) / 1000, better: m - ci > 1 / n };
+    }
+    const final = { round: lastRound, check, stopped_early: stoppedEarly };
+    save(final);
 
     log("");
     for (const s of specs) log(`  ${s.path.padEnd(28)} ${String(s.start).padStart(10)} → ${getPath(tuned, s.path)}`);
-    log(`Tuned vs start: ${(m * 100).toFixed(1)}% ± ${(ci * 100).toFixed(1)}% over ${checkGames} games (50% = no difference).`);
+    if (check) {
+      log(`Tuned vs start: ${(check.score * 100).toFixed(1)}% ± ${(check.ci95 * 100).toFixed(1)}% over ${checkGames} games ` +
+        `(${(100 / n).toFixed(0)}% = no difference).`);
+    }
+    const better = Boolean(check?.better);
     if (o.write) {
       if (!better) log("Not written to metafinder.json: the tuned values did not beat the start clearly. Try more rounds or games.");
       else {
@@ -337,9 +403,24 @@ async function main() {
     } else if (better) {
       log("The tuned values are better. Run again with --write to save them into metafinder.json.");
     }
+    progress("done", 1, "Finished");
+    emit({
+      type: "result",
+      game: { name: game.name, num_players: n },
+      params: specs.map((s) => ({ path: s.path, start: s.start, tuned: getPath(tuned, s.path), min: s.min, max: s.max })),
+      ...final,
+      rounds,
+      rounds_this_run: lastRound - startRound,
+      seconds: Math.round(elapsedS()),
+      settings: { iterations, games_per_round: games, threads, check_games: checkGames },
+    });
   } finally {
     await pool.close();
   }
 }
 
-await main();
+try {
+  await main();
+} catch (e) {
+  fail(`Unexpected error: ${e?.stack || e}`);
+}

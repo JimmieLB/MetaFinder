@@ -40,6 +40,9 @@
            background: var(--accent); color: var(--bg); white-space: nowrap; }
   button.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); font-weight: 500; }
   button:disabled { opacity: .5; cursor: default; }
+  a.btn { font-weight: 600; border-radius: 8px; padding: 10px 18px; background: var(--accent); color: var(--bg);
+          text-decoration: none; white-space: nowrap; display: inline-block; }
+  a.btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); font-weight: 500; }
   details summary { cursor: pointer; color: var(--muted); margin-top: 14px; user-select: none; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 12px; }
   label { font-size: 13px; color: var(--muted); display: block; }
@@ -128,6 +131,7 @@
       <div class="row">
         <input id="url" placeholder="https://github.com/owner/repo  (or /tree/branch/path/to/game)" autocomplete="off" required>
         <button id="go" type="submit">Analyze</button>
+        <button id="train" type="button" class="secondary" title="Improve the AI's scoring values by self-play (Node.js modules with a &quot;tune&quot; list)">Train AI</button>
       </div>
       <div class="chips hidden" id="examples"><span class="muted" style="font-size:13px">Try a bundled example:</span></div>
       <details>
@@ -142,6 +146,17 @@
         </div>
         <label style="margin-top:12px">Config overrides (JSON, passed to <code>new_game(seed, config)</code>)
           <textarea id="config" placeholder='{"max_hp": 20}'></textarea></label>
+      </details>
+      <details>
+        <summary>AI training</summary>
+        <p class="muted" style="font-size:14px;margin-top:12px">Train AI tunes the scoring values named in <code>metafinder.json</code>'s <code>"tune"</code> list by self-play (Node.js modules whose state has <code>withConfig(config)</code>). Progress is saved after every round. When a run ends or is stopped, download the progress to continue later, or download the game with the best values written into its <code>metafinder.json</code>.</p>
+        <div class="grid">
+          <label>Rounds (this run)<input id="t_rounds" type="number" value="20" min="1"></label>
+          <label>Iterations per move<input id="t_iterations" type="number" value="150" min="10"></label>
+          <label>Games per round<input id="t_games" type="number" placeholder="one per thread" min="2"></label>
+        </div>
+        <label style="margin-top:12px">Continue from saved progress (optional <code>.tuned.json</code> file)
+          <input id="t_checkpoint" type="file" accept=".json,application/json"></label>
       </details>
       <div id="formError" class="error hidden"></div>
     </form>
@@ -238,8 +253,10 @@ describe(), action_label(a), strategy_key(), drain_events()     improve the repo
 
 <script>
 const $ = (id) => document.getElementById(id);
-const PHASES = [["clone", "Fetch"], ["load", "Load"], ["validate", "Conformance"], ["opening", "Opening search"],
-                ["selfplay", "Self-play"], ["baseline", "vs Random"]];
+const ANALYZE_PHASES = [["clone", "Fetch"], ["load", "Load"], ["validate", "Conformance"], ["opening", "Opening search"],
+                        ["selfplay", "Self-play"], ["baseline", "vs Random"]];
+const TUNE_PHASES = [["clone", "Fetch"], ["load", "Load"], ["train", "Training"], ["check", "Tuned vs start"]];
+const phasesFor = (job) => (job.kind === "tune" ? TUNE_PHASES : ANALYZE_PHASES);
 let pollTimer = null, currentJob = null;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -260,27 +277,49 @@ fetch("/api/examples").then(r => r.json()).then(list => {
   }
 }).catch(() => {});
 
-$("form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  $("formError").classList.add("hidden");
-  let config = {};
+function readConfig() {
   const raw = $("config").value.trim();
-  if (raw) {
-    try { config = JSON.parse(raw); } catch { return showFormError("Config overrides must be valid JSON."); }
-  }
-  const body = { repo_url: $("url").value, config };
-  for (const k of ["iterations", "games", "opening_iterations", "exploration", "rollout_depth", "seed"]) {
-    const v = $(k).value; if (v !== "") body[k] = Number(v);
-  }
-  $("go").disabled = true;
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { throw new Error("Config overrides must be valid JSON."); }
+}
+
+async function submitJob(endpoint, button, buildBody) {
+  $("formError").classList.add("hidden");
+  if (!$("url").reportValidity()) return;
+  button.disabled = true;
   try {
-    const r = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const body = await buildBody();
+    const r = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const data = await r.json();
     if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : data.detail.map(d => `${d.loc.at(-1)}: ${d.msg}`).join("\n"));
     rememberJob(data.id, body.repo_url);
     startPolling(data.id);
   } catch (err) { showFormError(err.message); }
-  $("go").disabled = false; // jobs keep running on the server, so another one can be started any time
+  button.disabled = false; // jobs keep running on the server, so another one can be started any time
+}
+
+$("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  submitJob("/api/jobs", $("go"), () => {
+    const body = { repo_url: $("url").value, config: readConfig() };
+    for (const k of ["iterations", "games", "opening_iterations", "exploration", "rollout_depth", "seed"]) {
+      const v = $(k).value; if (v !== "") body[k] = Number(v);
+    }
+    return body;
+  });
+});
+
+$("train").onclick = () => submitJob("/api/tune", $("train"), async () => {
+  const body = { repo_url: $("url").value, config: readConfig(), exploration: Number($("exploration").value) || 0.7 };
+  for (const [id, k] of [["t_rounds", "rounds"], ["t_iterations", "iterations"], ["t_games", "games"]]) {
+    const v = $(id).value; if (v !== "") body[k] = Number(v);
+  }
+  const file = $("t_checkpoint").files[0];
+  if (file) {
+    try { body.checkpoint = JSON.parse(await file.text()); }
+    catch { throw new Error(`${file.name} is not valid JSON. Pick a .tuned.json file saved from a training run.`); }
+  }
+  return body;
 });
 
 function showFormError(msg) { $("formError").textContent = msg; $("formError").classList.remove("hidden"); }
@@ -392,12 +431,14 @@ function startPolling(id) {
     if (currentJob !== id || finished) return;
     if (!remembered) { remembered = true; rememberJob(id, job.repo); } // jobs opened by ID join the recent list
     renderProgress(job);
-    if (!ACTIVE.includes(job.status)) {
+    // A training job is followed until the server has packaged its downloads (also after a cancel or error).
+    if (!ACTIVE.includes(job.status) && (job.kind !== "tune" || job.finalized)) {
       finished = true;
       clearInterval(pollTimer); $("cancel").classList.add("hidden");
       rememberJob(id, job.repo);
       renderRecent();
       if (job.status === "done") { $("progress").classList.add("hidden"); renderResults(job); }
+      else if (job.kind === "tune" && (job.training || job.downloads_error)) renderTraining(job);
     }
   };
   tick(); pollTimer = setInterval(tick, 700);
@@ -414,7 +455,10 @@ function startPolling(id) {
 })();
 
 function renderProgress(job) {
+  const PHASES = phasesFor(job);
   const idx = PHASES.findIndex(([k]) => k === job.phase);
+  if (ACTIVE.includes(job.status)) $("progressTitle").textContent = job.kind === "tune" ? "Training AI…" : "Analyzing…";
+  else if (job.kind === "tune" && !job.finalized) $("progressTitle").textContent = "Saving training progress…";
   $("phases").innerHTML = PHASES.map(([k, name], i) =>
     `<span class="phase ${i < idx || job.phase === "done" ? "done" : i === idx ? "active" : ""}">${name}</span>`).join("");
   const within = job.pct || 0;
@@ -422,7 +466,7 @@ function renderProgress(job) {
   $("fill").style.width = (overall * 100).toFixed(1) + "%";
   $("progressMsg").textContent = job.message || "";
   if (job.status === "error" || job.status === "cancelled") {
-    $("progressTitle").textContent = job.status === "error" ? "Analysis failed" : "Cancelled";
+    $("progressTitle").textContent = job.status === "error" ? (job.kind === "tune" ? "Training failed" : "Analysis failed") : "Cancelled";
     if (job.status === "error") {
       $("jobError").className = "error";
       $("jobError").innerHTML = esc(job.message) + (job.traceback ? `<details><summary>Details</summary><pre>${esc(job.traceback)}</pre></details>` : "");
@@ -430,7 +474,57 @@ function renderProgress(job) {
   }
 }
 
+/** Training results: the tuned values, the tuned-vs-start check, and the two downloads. */
+function renderTraining(job) {
+  const t = job.training, r = job.result, dl = job.downloads || {};
+  const out = [];
+  const name = r?.game?.name || shortRepo(job.repo);
+  const resumed = job.resumed_from ? ` · continued from round ${job.resumed_from}` : "";
+  let verdict = "";
+  if (t?.check) {
+    const c = t.check, even = 1 / (r?.game?.num_players || 2);
+    verdict = c.better
+      ? `The tuned AI beat the starting values: <strong>${pct(c.score, 1)}</strong> ± ${pct(c.ci95, 1)} over ${c.games} games.`
+      : c.score > even
+        ? `The tuned AI scored ${pct(c.score, 1)} ± ${pct(c.ci95, 1)} against the starting values over ${c.games} games: ahead, but not clearly yet. More rounds or games per round will tell.`
+        : `The tuned AI did not beat the starting values (${pct(c.score, 1)} ± ${pct(c.ci95, 1)} over ${c.games} games), so the download keeps the starting values. Keep training to explore further.`;
+  } else if (t) {
+    verdict = t.stopped_early || job.status !== "done"
+      ? "The run stopped before the final tuned-vs-start check. The download uses the latest tuned values; continue training to check them."
+      : "";
+  }
+  if (t) {
+    out.push(`<section class="card">
+      <h2>${esc(name)}: AI training</h2>
+      <div class="chips" style="margin:0 0 16px">
+        <span class="chip">Round ${t.round}${t.rounds ? ` of ${t.rounds}` : ""}</span>
+        ${t.stopped_early ? '<span class="chip">Stopped at the time limit</span>' : ""}
+        ${job.status === "cancelled" ? '<span class="chip">Cancelled</span>' : ""}
+        ${r?.settings ? `<span class="chip">${r.settings.games_per_round} games/round · ${num(r.settings.iterations)} iterations/move · ${r.settings.threads} threads</span>` : ""}
+        <span class="chip muted">${esc(job.repo)}${resumed}</span>
+      </div>
+      ${verdict ? `<p>${verdict}</p>` : ""}
+      <table><thead><tr><th>Value</th><th class="num">Start</th><th class="num">Tuned</th><th class="num">Change</th><th class="num">Range</th></tr></thead><tbody>
+      ${t.params.map(p => `<tr><td><code>${esc(p.path)}</code></td><td class="num">${esc(p.start)}</td><td class="num"><strong>${esc(p.tuned)}</strong></td>
+        <td class="num">${p.start ? (p.tuned >= p.start ? "+" : "") + ((p.tuned / p.start - 1) * 100).toFixed(1) + "%" : ""}</td>
+        <td class="num muted">${esc(p.min)}–${esc(p.max)}</td></tr>`).join("")}
+      </tbody></table>
+    </section>`);
+  }
+  out.push(`<section class="card"><h2>Save &amp; download</h2>
+    <p class="muted"><strong>Training progress</strong> is a <code>.tuned.json</code> file. Choose it under <em>AI training → Continue from saved progress</em> to pick up where this run stopped (also works from the command line: <code>tune.mjs --resume</code>). Downloads are kept until the server restarts.</p>
+    <p class="muted"><strong>Game with the best AI</strong> is a zip of the game folder with ${t?.game_values === "start" ? "the starting" : "the tuned"} values in <code>metafinder.json</code>, plus the training progress.</p>
+    ${job.downloads_error ? `<div class="error">${esc(job.downloads_error)}</div>` : ""}
+    <div class="chips">
+      ${dl.game ? `<a class="btn" href="/api/jobs/${encodeURIComponent(job.id)}/game.zip" download>Download game with best AI (.zip)</a>` : ""}
+      ${dl.checkpoint ? `<a class="btn secondary" href="/api/jobs/${encodeURIComponent(job.id)}/checkpoint" download>Save training progress (.json)</a>` : ""}
+    </div>
+  </section>`);
+  $("results").innerHTML = out.join("");
+}
+
 function renderResults(job) {
+  if (job.kind === "tune") return renderTraining(job);
   const r = job.result, g = r.game, sp = r.self_play, op = r.opening, base = r.baseline;
   const out = [];
 
