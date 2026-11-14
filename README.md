@@ -31,7 +31,7 @@ reach the page can run programs on your server. The deployment is set up to limi
   server won't start on a public address without it, unless you also set `METAFINDER_ALLOW_PUBLIC=1`.
 - **Separate user:** each analysis runs as an unprivileged `runner` user with a stripped-down environment, so
   it can't read the password or Railway's variables.
-- **Resource limits:** each analysis gets CPU-time, memory, file-size and process limits, and is killed along
+- **Resource limits:** each analysis gets CPU-time, memory and file-size limits, and is killed along
   with anything it started once it finishes or times out.
 - **No local folders:** they are switched off. GitHub URLs and the bundled examples still work.
 

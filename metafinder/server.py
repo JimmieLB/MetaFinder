@@ -148,9 +148,11 @@ def worker_command(runtime: str, repo_dir: Path, params_path: Path) -> list[str]
         cmd = [sys.executable, "-m", "metafinder.worker", "--repo", str(repo_dir), "--params", str(params_path)]
     bash = shutil.which("bash") if POSIX else None
     if bash:
-        # Resource limits for the submitted code: CPU seconds, file size (KB), processes/threads for the
-        # worker's user, and (Python only; V8 reserves far more address space than it uses) memory.
-        limits = f"ulimit -t {JOB_TIMEOUT + 60} && ulimit -f 262144 && ulimit -u 512"
+        # Resource limits for the submitted code: CPU seconds, file size (KB) and (Python only; V8 reserves
+        # far more address space than it uses) memory. No process limit (ulimit -u): Linux counts it per
+        # user ID across the whole host, so on shared container hosts it's already used up by other
+        # containers and Node can't even start its threads. The container's own pids limit covers that.
+        limits = f"ulimit -t {JOB_TIMEOUT + 60} && ulimit -f 262144"
         if runtime != "node":
             limits += f" && ulimit -v {WORKER_MEMORY_MB * 1024}"
         cmd = [bash, "-c", f'{limits} && exec "$@"', "metafinder-worker", *cmd]
