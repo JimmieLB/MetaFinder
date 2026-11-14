@@ -298,15 +298,18 @@ search, so tune near the iteration count you analyse with if you have the time.
 **Train AI** (next to Analyze) runs the same tuner on the server for the repository in the box. Rounds, iterations
 per move and games per round are under **AI training**. A run saves its progress after every round and stops
 cleanly before `METAFINDER_TUNE_TIMEOUT` (default: the analysis timeout). When it finishes, hits the limit or is
-cancelled, the page offers two downloads:
+cancelled, the page offers its downloads:
 
 - **Save training progress (.json)**: the `metafinder.tuned.json` checkpoint. Choose it under **AI training →
   Continue from saved progress** and press Train AI again to run that many more rounds from where it stopped.
   It must come from the same game and the same `"tune"` list.
-- **Download game with best AI (.zip)**: the game folder (without `.git`) with the best values written into
-  `metafinder.json`'s `config`, plus the checkpoint. "Best" means the tuned values, unless the final
-  tuned-vs-start check found them no better, in which case the starting values are kept. With the checkpoint
-  inside, `tune.mjs --repo <unzipped folder> --resume --more-rounds N` continues training locally too.
+- **Save replay: tuned vs starting AI (.json)**: after the final check, the run plays one game of the tuned AI
+  (player 0) against the AI with the starting values and saves it as `metafinder.replay.json`. It lists every
+  move with the player, which AI made it, its label, the raw action, the AI's value estimate, and the position
+  after it (`describe()` text and `toJSON()` data). It also includes `initial`, the seed, the referee config and
+  each side's values, so `newGame(seed, referee_config)` plus the raw actions in order reproduces the game. A run
+  that's cancelled or runs out of time before this point has no replay. The command-line tuner writes the same file
+  next to its checkpoint (`--replay FILE` to change that).
 
 Downloads live in the server's job folder, so they are lost on a restart or redeploy: save them when a run ends.
 Threads per run: `METAFINDER_TUNE_THREADS`, or by default the container's CPUs − 1 (its CPU quota counts,
@@ -332,8 +335,8 @@ round or the iterations per move.
 
 Settings are environment variables: `METAFINDER_JOB_TIMEOUT` (seconds, default 900), `METAFINDER_MAX_CONCURRENT`
 (default 2), `METAFINDER_ALLOW_LOCAL` (default `1`: accepts local paths and shows the example buttons),
-`METAFINDER_JOBS_DIR`, `METAFINDER_NODE`, and for AI training `METAFINDER_TUNE_TIMEOUT`, `METAFINDER_TUNE_THREADS` and
-`METAFINDER_MAX_DOWNLOAD_MB`. To keep them in a file, copy [example.env](example.env) to `.env`.
+`METAFINDER_JOBS_DIR`, `METAFINDER_NODE`, and for AI training `METAFINDER_TUNE_TIMEOUT` and
+`METAFINDER_TUNE_THREADS`. To keep them in a file, copy [example.env](example.env) to `.env`.
 `python -m metafinder` reads it at startup, or another file passed with `--env-file`. Variables already set in the
 environment take priority.
 

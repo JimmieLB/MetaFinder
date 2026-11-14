@@ -149,7 +149,7 @@
       </details>
       <details>
         <summary>AI training</summary>
-        <p class="muted" style="font-size:14px;margin-top:12px">Train AI tunes the scoring values named in <code>metafinder.json</code>'s <code>"tune"</code> list by self-play (Node.js modules whose state has <code>withConfig(config)</code>). Progress is saved after every round. When a run ends or is stopped, download the progress to continue later, or download the game with the best values written into its <code>metafinder.json</code>.</p>
+        <p class="muted" style="font-size:14px;margin-top:12px">Train AI tunes the scoring values named in <code>metafinder.json</code>'s <code>"tune"</code> list by self-play (Node.js modules whose state has <code>withConfig(config)</code>). Progress is saved after every round. When a run ends or is stopped, download the progress to continue later. A finished run also plays one game of the tuned AI against the starting AI, which you can download as a replay.</p>
         <div class="grid">
           <label>Rounds (this run)<input id="t_rounds" type="number" value="20" min="1"></label>
           <label>Iterations per move<input id="t_iterations" type="number" value="150" min="10"></label>
@@ -255,7 +255,7 @@ describe(), action_label(a), strategy_key(), drain_events()     improve the repo
 const $ = (id) => document.getElementById(id);
 const ANALYZE_PHASES = [["clone", "Fetch"], ["load", "Load"], ["validate", "Conformance"], ["opening", "Opening search"],
                         ["selfplay", "Self-play"], ["baseline", "vs Random"]];
-const TUNE_PHASES = [["clone", "Fetch"], ["load", "Load"], ["train", "Training"], ["check", "Tuned vs start"]];
+const TUNE_PHASES = [["clone", "Fetch"], ["load", "Load"], ["train", "Training"], ["check", "Tuned vs start"], ["replay", "Replay game"]];
 const phasesFor = (job) => (job.kind === "tune" ? TUNE_PHASES : ANALYZE_PHASES);
 let pollTimer = null, currentJob = null;
 
@@ -474,7 +474,15 @@ function renderProgress(job) {
   }
 }
 
-/** Training results: the tuned values, the tuned-vs-start check, and the two downloads. */
+/** Training results: the tuned values, the tuned-vs-start check, and the downloads (progress, replay). */
+/** "won", "lost", "drew" or "scored N%" for the tuned AI (seat 0) in the replay. */
+function replayOutcome(res) {
+  const total = res.returns.reduce((a, b) => a + b, 0) || 1, share = res.returns[0] / total;
+  const cap = res.finished ? "" : ", scored at the step cap";
+  if (res.returns.length === 2 && res.finished) return (share > 0.5 ? "won" : share < 0.5 ? "lost" : "drew") + cap;
+  return `scored ${pct(share)}${cap}`;
+}
+
 function renderTraining(job) {
   const t = job.training, r = job.result, dl = job.downloads || {};
   const out = [];
@@ -487,10 +495,10 @@ function renderTraining(job) {
       ? `The tuned AI beat the starting values: <strong>${pct(c.score, 1)}</strong> ± ${pct(c.ci95, 1)} over ${c.games} games.`
       : c.score > even
         ? `The tuned AI scored ${pct(c.score, 1)} ± ${pct(c.ci95, 1)} against the starting values over ${c.games} games: ahead, but not clearly yet. More rounds or games per round will tell.`
-        : `The tuned AI did not beat the starting values (${pct(c.score, 1)} ± ${pct(c.ci95, 1)} over ${c.games} games), so the download keeps the starting values. Keep training to explore further.`;
+        : `The tuned AI did not beat the starting values (${pct(c.score, 1)} ± ${pct(c.ci95, 1)} over ${c.games} games). Keep training to explore further.`;
   } else if (t) {
     verdict = t.stopped_early || job.status !== "done"
-      ? "The run stopped before the final tuned-vs-start check. The download uses the latest tuned values; continue training to check them."
+      ? "The run stopped before the final tuned-vs-start check. Continue training from the saved progress to check the values."
       : "";
   }
   if (t) {
@@ -513,10 +521,10 @@ function renderTraining(job) {
   }
   out.push(`<section class="card"><h2>Save &amp; download</h2>
     <p class="muted"><strong>Training progress</strong> is a <code>.tuned.json</code> file. Choose it under <em>AI training → Continue from saved progress</em> to pick up where this run stopped (also works from the command line: <code>tune.mjs --resume</code>). Downloads are kept until the server restarts.</p>
-    <p class="muted"><strong>Game with the best AI</strong> is a zip of the game folder with ${t?.game_values === "start" ? "the starting" : "the tuned"} values in <code>metafinder.json</code>, plus the training progress.</p>
+    <p class="muted"><strong>Replay</strong> is one game of the tuned AI (player 0) against the starting AI as JSON: every move with the AI that made it, its value estimate and the position after it${t?.replay ? ` (${t.replay.result.steps} moves, tuned AI ${replayOutcome(t.replay.result)})` : ""}.${dl.checkpoint && !dl.replay ? " This run ended before the replay game was played." : ""}</p>
     ${job.downloads_error ? `<div class="error">${esc(job.downloads_error)}</div>` : ""}
     <div class="chips">
-      ${dl.game ? `<a class="btn" href="/api/jobs/${encodeURIComponent(job.id)}/game.zip" download>Download game with best AI (.zip)</a>` : ""}
+      ${dl.replay ? `<a class="btn" href="/api/jobs/${encodeURIComponent(job.id)}/replay" download>Save replay: tuned vs starting AI (.json)</a>` : ""}
       ${dl.checkpoint ? `<a class="btn secondary" href="/api/jobs/${encodeURIComponent(job.id)}/checkpoint" download>Save training progress (.json)</a>` : ""}
     </div>
   </section>`);

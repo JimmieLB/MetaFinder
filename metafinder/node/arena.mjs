@@ -6,13 +6,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
-import { CHANCE, MCTS, Rng, sampleChance } from "./mcts.mjs";
+import { CHANCE, MCTS, Rng, actionKey, sampleChance } from "./mcts.mjs";
 import { loadGame } from "./load.mjs";
 
 /**
  * Plays one game. `match` = {seed, referee, seats: [{config, iterations, reuseTree}], exploration,
- * rolloutDepth, maxSteps}. Returns {returns, steps, finished} where `finished` means the game ended
- * by its own rules rather than the step cap.
+ * rolloutDepth, maxSteps, record}. Returns {returns, steps, finished} where `finished` means the game
+ * ended by its own rules rather than the step cap. With `record`, also `moves` (one entry per action, with
+ * the position after it) and `initial` (the starting position), for a replay.
  */
 export function playMatch(game, match) {
   const s = game.newGame(match.seed, structuredClone(match.referee));
@@ -31,25 +32,54 @@ export function playMatch(game, match) {
     rng: new Rng(match.seed * 131 + p),
     reuseTree: seat.reuseTree ?? true,
   }));
+  const moves = match.record ? [] : null;
+  const initial = match.record ? snapshot(s) : null;
   let steps = 0;
   while (!s.isTerminal() && steps < match.maxSteps) {
     const p = s.currentPlayer();
     let a;
+    let value = null;
     if (p === CHANCE) a = sampleChance(s, rng);
     else {
       const view = s.withConfig(structuredClone(match.seats[p].config));
-      a = engines[p].bestAction(view, p)[0];
+      const [best, root] = engines[p].bestAction(view, p);
+      a = best;
+      if (match.record) value = root.children.get(actionKey(a))?.mean(p) ?? null;
     }
+    const actionLabel = match.record ? label(s, a) : null;
     s.apply(a);
     for (const e of engines) e.advance(a);
     steps += 1;
+    if (match.record) {
+      moves.push({
+        step: steps,
+        player: p === CHANCE ? "chance" : p,
+        ai: p === CHANCE ? null : match.seats[p].name ?? null,
+        action: actionLabel,
+        raw_action: JSON.parse(JSON.stringify(a ?? null)),
+        value: value == null ? null : Math.round(value * 1000) / 1000,
+        ...snapshot(s),
+      });
+    }
   }
   const finished = s.isTerminal();
   let returns;
   if (finished) returns = Array.from(s.returns());
   else if (typeof s.heuristicValue === "function") returns = Array.from(s.heuristicValue());
   else returns = new Array(game.numPlayers).fill(1 / game.numPlayers);
-  return { returns, steps, finished };
+  return match.record ? { returns, steps, finished, initial, moves } : { returns, steps, finished };
+}
+
+const label = (state, a) => (typeof state.actionLabel === "function" ? String(state.actionLabel(a))
+  : typeof a === "object" ? JSON.stringify(a) : String(a));
+
+/** The position as the module describes it: describe() text and toJSON() data, when it has them. */
+function snapshot(state) {
+  const out = {};
+  if (typeof state.describe === "function") out.position = String(state.describe());
+  // A deep copy: toJSON() may hand out the state's own arrays, which later moves change.
+  if (typeof state.toJSON === "function") out.state = JSON.parse(JSON.stringify(state.toJSON()));
+  return out;
 }
 
 /** Runs matches on worker threads, each of which imports the game module once. */

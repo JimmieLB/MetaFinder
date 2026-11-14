@@ -18,7 +18,6 @@ import sys
 import threading
 import time
 import uuid
-import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -44,7 +43,6 @@ POSIX = os.name == "posix"
 # A run that reaches it stops cleanly and its progress can be resumed later.
 TUNE_TIMEOUT = int(os.environ.get("METAFINDER_TUNE_TIMEOUT", JOB_TIMEOUT))
 TUNE_THREADS = int(os.environ.get("METAFINDER_TUNE_THREADS", 0))  # 0 = CPU cores − 1
-MAX_DOWNLOAD_MB = int(os.environ.get("METAFINDER_MAX_DOWNLOAD_MB", 200))  # cap on the game folder zipped for download
 CHECKPOINT = "metafinder.tuned.json"
 
 GITHUB_RE = re.compile(
@@ -343,7 +341,6 @@ def _run_job(job_id: str, source: dict, params: dict, kind: str = "analyze", che
     with _slots:
         if _jobs[job_id]["status"] == "cancelled":
             return
-        repo_dir = None
         try:
             repo_dir = _fetch(job_id, source, job_dir)
             runtime = detect_runtime(repo_dir)
@@ -363,9 +360,9 @@ def _run_job(job_id: str, source: dict, params: dict, kind: str = "analyze", che
         except Exception as e:
             _update(job_id, status="error", message=str(e), finished=time.time())
         finally:
-            if kind == "tune" and repo_dir is not None:
+            if kind == "tune":
                 try:
-                    _collect_training(job_id, job_dir, repo_dir)
+                    _collect_training(job_id, job_dir)
                 except Exception as e:  # never lose the job's own status over the downloads
                     _update(job_id, downloads_error=f"Could not prepare the downloads: {e}")
             if source["kind"] == "github" and (job_dir / "repo").exists():
@@ -398,99 +395,50 @@ def _run_tune(job_id: str, job_dir: Path, repo_dir: Path, runtime: str, params: 
     _stream(job_id, cmd, job_dir, TUNE_TIMEOUT, "Training complete")
 
 
-def _get_path(obj, dotted: str):
-    for k in dotted.split("."):
-        if not isinstance(obj, dict):
-            return None
-        obj = obj.get(k)
-    return obj
+REPLAY = "metafinder.replay.json"
 
 
-def _set_path(obj: dict, dotted: str, value) -> None:
-    keys = dotted.split(".")
-    for k in keys[:-1]:
-        if not isinstance(obj.get(k), dict):
-            obj[k] = {}
-        obj = obj[k]
-    obj[keys[-1]] = value
-
-
-def _read_checkpoint(path: Path) -> dict | None:
-    """Reads the worker-written checkpoint defensively: a regular file (not a link), small, valid JSON."""
+def _read_worker_json(path: Path, max_mb: int) -> dict | None:
+    """Reads a file the worker wrote, defensively: a regular file (not a link), not too large, a JSON object."""
     try:
         st = path.lstat()
     except OSError:
         return None
-    if not stat.S_ISREG(st.st_mode) or st.st_size > 20 * 1024 * 1024:
+    if not stat.S_ISREG(st.st_mode) or st.st_size > max_mb * 1024 * 1024:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict) or not isinstance(data.get("params"), list) or not isinstance(data.get("round"), int):
-        return None
-    return data
+    return data if isinstance(data, dict) else None
 
 
-def _collect_training(job_id: str, job_dir: Path, repo_dir: Path) -> None:
-    """After a training run (finished, stopped, cancelled or failed): keeps the latest checkpoint for download
-    and zips the game with the best AI values written into its metafinder.json."""
-    ck = _read_checkpoint(job_dir / "train" / CHECKPOINT)
-    # Only progress made by this run counts (an uploaded checkpoint that was rejected must not end up in a zip).
-    if ck is None or ck["round"] <= (_jobs[job_id].get("resumed_from") or 0):
+def _download_name(job_id: str) -> str:
+    repo = _jobs[job_id]["repo"].rstrip("/").replace("\\", "/")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", repo.rsplit("/", 1)[-1] or "game").strip("-.") or "game"
+
+
+def _collect_training(job_id: str, job_dir: Path) -> None:
+    """After a training run (finished, stopped, cancelled or failed): keeps the latest checkpoint and the
+    tuned-vs-start replay game for download."""
+    ck = _read_worker_json(job_dir / "train" / CHECKPOINT, 20)
+    # Only progress made by this run counts (an uploaded checkpoint that was rejected isn't offered back).
+    if ck is None or not isinstance(ck.get("params"), list) or not isinstance(ck.get("round"), int) \
+            or ck["round"] <= (_jobs[job_id].get("resumed_from") or 0):
         return
     (job_dir / "checkpoint.json").write_text(json.dumps(ck, indent=2) + "\n", encoding="utf-8")
-
     params = [p for p in ck["params"] if isinstance(p, dict) and isinstance(p.get("path"), str)]
     check = ck.get("check") if isinstance(ck.get("check"), dict) else None
-    result = _jobs[job_id].get("result") or {}
-    n_players = (result.get("game") or {}).get("num_players")
-    # The tuned values are the best estimate, unless the final check found them no better than where we started.
-    worse = check is not None and n_players and check.get("score", 1) <= 1 / n_players
-    use = "start" if worse else "tuned"
-    summary = {"round": ck["round"], "rounds": ck.get("rounds"), "check": check,
-               "stopped_early": bool(ck.get("stopped_early")), "params": params, "game_values": use}
-    _update(job_id, training=summary, downloads={"checkpoint": True, "game": False})
+    downloads = {"checkpoint": True, "replay": False, "name": _download_name(job_id)}
 
-    manifest_path = repo_dir / "metafinder.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        raise RuntimeError(f"metafinder.json could not be read: {e}") from e
-    manifest.setdefault("config", {})
-    for p in params:
-        value = p.get(use)
-        if isinstance(value, (int, float)) and value > 0:
-            _set_path(manifest["config"], p["path"], value)
-
-    files, total = [], 0
-    root = repo_dir.resolve()
-    for dirpath, dirnames, filenames in os.walk(root):  # does not follow directory links
-        dirnames[:] = [d for d in dirnames if d != ".git" and not os.path.islink(os.path.join(dirpath, d))]
-        for name in filenames:
-            full = Path(dirpath) / name
-            rel = full.relative_to(root).as_posix()
-            if rel in ("metafinder.json", CHECKPOINT):
-                continue
-            st = full.lstat()
-            if not stat.S_ISREG(st.st_mode):  # skip links: they could point outside the game folder
-                continue
-            total += st.st_size
-            files.append((full, rel))
-    if total > MAX_DOWNLOAD_MB * 1024 * 1024:
-        _update(job_id, downloads_error=f"The game folder is over {MAX_DOWNLOAD_MB} MB, so it wasn't zipped. "
-                                        "Download the training progress and copy its values into metafinder.json.")
-        return
-
-    top = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(_jobs[job_id]["repo"].rstrip("/")).name or "game").strip("-.") or "game"
-    tmp = job_dir / "game.zip.tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-        for full, rel in files:
-            z.write(full, f"{top}/{rel}")
-        z.writestr(f"{top}/metafinder.json", json.dumps(manifest, indent=2) + "\n")
-        z.writestr(f"{top}/{CHECKPOINT}", json.dumps(ck, indent=2) + "\n")
-    tmp.replace(job_dir / "game.zip")
-    _update(job_id, downloads={"checkpoint": True, "game": True, "name": top})
+    replay = _read_worker_json(job_dir / "train" / REPLAY, 50)
+    if replay is not None and str(replay.get("format", "")).startswith("metafinder-replay/"):
+        (job_dir / "replay.json").write_text(json.dumps(replay, indent=1) + "\n", encoding="utf-8")
+        downloads["replay"] = True
+    _update(job_id, downloads=downloads,
+            training={"round": ck["round"], "rounds": ck.get("rounds"), "check": check,
+                      "stopped_early": bool(ck.get("stopped_early")), "params": params,
+                      "replay": {k: replay.get(k) for k in ("result", "players")} if downloads["replay"] else None})
 
 
 # --------------------------------------------------------------------------- routes
@@ -535,16 +483,15 @@ def _job_file(job_id: str, name: str) -> Path:
 @app.get("/api/jobs/{job_id}/checkpoint")
 def download_checkpoint(job_id: str):
     """The training progress: upload it to a new training run to continue where this one stopped."""
-    name = (_jobs[job_id].get("downloads") or {}).get("name", "game") if job_id in _jobs else "game"
-    return FileResponse(_job_file(job_id, "checkpoint.json"), media_type="application/json",
-                        filename=f"{name}.{CHECKPOINT}")
+    path = _job_file(job_id, "checkpoint.json")
+    return FileResponse(path, media_type="application/json", filename=f"{_download_name(job_id)}.{CHECKPOINT}")
 
 
-@app.get("/api/jobs/{job_id}/game.zip")
-def download_game(job_id: str):
-    """The game folder with the best AI values in metafinder.json (and the training progress alongside)."""
-    name = (_jobs[job_id].get("downloads") or {}).get("name", "game") if job_id in _jobs else "game"
-    return FileResponse(_job_file(job_id, "game.zip"), media_type="application/zip", filename=f"{name}-trained-ai.zip")
+@app.get("/api/jobs/{job_id}/replay")
+def download_replay(job_id: str):
+    """One game of the tuned AI against the starting AI, move by move."""
+    path = _job_file(job_id, "replay.json")
+    return FileResponse(path, media_type="application/json", filename=f"{_download_name(job_id)}.{REPLAY}")
 
 
 @app.get("/api/jobs/{job_id}")

@@ -37,6 +37,8 @@ const HELP = `Tunes a game's AI-scoring values by self-play.
   --config JSON       rule overrides merged into the manifest config, e.g. '{"max_turns": 25}'
   --referee JSON      config used to score games that hit the turn limit (default: base config minus tuned keys)
   --out FILE          checkpoint/result file (default: DIR/metafinder.tuned.json)
+  --replay FILE       where the closing tuned-vs-start replay game is saved (default: metafinder.replay.json
+                      next to --out)
   --resume            continue from the checkpoint in --out
   --write             save the tuned values into metafinder.json if they beat the start clearly
   --seed N            random seed (default: time-based)
@@ -76,6 +78,7 @@ function parseArgs(argv) {
     else if (a === "--config") o.config = parseJson(v(), a);
     else if (a === "--referee") o.referee = parseJson(v(), a);
     else if (a === "--out") o.out = v();
+    else if (a === "--replay") o.replay = v();
     else if (a === "--resume") o.resume = true;
     else if (a === "--write") o.write = true;
     else if (a === "--seed") o.seed = num(v(), a);
@@ -266,6 +269,7 @@ async function main() {
     match: { referee, exploration: o.exploration ?? 0.7, rolloutDepth: Number.parseInt(game.rolloutDepth ?? maxSteps, 10), maxSteps },
   };
   const outFile = path.resolve(o.out ?? path.join(repo, "metafinder.tuned.json"));
+  const replayFile = path.resolve(o.replay ?? path.join(path.dirname(outFile), "metafinder.replay.json"));
 
   let theta = specs.map((s) => Math.log(s.start));
   let startRound = 0;
@@ -354,7 +358,14 @@ async function main() {
 
   // Between rounds the run stops by itself before the limit; this catches a round (or the check) that
   // overruns it. theta only changes after a full round, so the checkpoint on disk is still current.
+  let finalState = null; // set once training and the check are done and saved
   const deadline = o.timeLimit ? setTimeout(() => {
+    if (finalState) { // only the replay game was cut
+      log("Time limit: stopped during the replay game; training results are saved.");
+      progress("done", 1, "Finished (no time left for the replay)");
+      emit(resultFor(finalState));
+      process.exit(0);
+    }
     if (lastRound === startRound) {
       fail(`Round ${startRound + 1} didn't finish within the ${fmtTime(o.timeLimit)} time limit ` +
         `(${games} games at ${iterations} iterations/move on ${threads} threads), so there is no progress to save. ` +
@@ -426,9 +437,42 @@ async function main() {
       const ci = 1.96 * stderr(scores);
       check = { games: checkGames, score: Math.round(m * 1000) / 1000, ci95: Math.round(ci * 1000) / 1000, better: m - ci > 1 / n };
     }
-    if (deadline) clearTimeout(deadline);
     const final = { round: lastRound, check, stopped_early: stoppedEarly };
     save(final);
+    finalState = final;
+
+    // Replay: one game of the tuned AI (seat 0) against the starting AI, for the record.
+    const gameTime = perRound / Math.ceil(games / threads);
+    if (o.timeLimit && elapsedS() + gameTime * 1.5 > o.timeLimit) {
+      log("Time limit: skipped the replay game.");
+    } else {
+      progress("replay", 0, "Playing a replay game: tuned AI vs starting AI");
+      const replaySeed = seed + 7_000_000;
+      const seats = Array.from({ length: n }, (_, p) => ({
+        name: p === 0 ? "tuned" : "start", config: p === 0 ? tuned : startCfg, iterations,
+      }));
+      const r = await pool.play({ ...ctx.match, seed: replaySeed, seats, record: true });
+      const values = (cfg) => Object.fromEntries(specs.map((s) => [s.path, getPath(cfg, s.path)]));
+      const replay = {
+        format: "metafinder-replay/1",
+        note: "One game between the tuned AI (seat 0) and the AI with the starting values. Replay it with " +
+          "game.newGame(seed, referee_config) and apply each move's raw_action in order (chance outcomes included).",
+        game: game.name,
+        seed: replaySeed,
+        referee_config: referee,
+        players: seats.map((s, p) => ({ seat: p, ai: s.name, values: values(s.config) })),
+        settings: { iterations, exploration: ctx.match.exploration, max_steps: maxSteps },
+        training: { round: lastRound, check },
+        result: { returns: r.returns, finished: r.finished, steps: r.steps },
+        initial: r.initial,
+        moves: r.moves,
+      };
+      fs.writeFileSync(replayFile, JSON.stringify(replay) + "\n");
+      const tunedShare = r.returns[0] / Math.max(1e-9, r.returns.reduce((a, b) => a + b, 0));
+      log(`Replay: ${r.steps} moves, tuned AI scored ${(tunedShare * 100).toFixed(0)}%${r.finished ? "" : " (hit the step cap)"}. Saved to ${replayFile}`);
+      final.replay = { steps: r.steps, returns: r.returns, finished: r.finished };
+    }
+    if (deadline) clearTimeout(deadline);
 
     log("");
     for (const s of specs) log(`  ${s.path.padEnd(28)} ${String(s.start).padStart(10)} → ${getPath(tuned, s.path)}`);
