@@ -309,7 +309,11 @@ cancelled, the page offers two downloads:
   inside, `tune.mjs --repo <unzipped folder> --resume --more-rounds N` continues training locally too.
 
 Downloads live in the server's job folder, so they are lost on a restart or redeploy: save them when a run ends.
-`METAFINDER_TUNE_THREADS` sets the threads per run (default: CPU cores − 1).
+Threads per run: `METAFINDER_TUNE_THREADS`, or by default the container's CPUs − 1 (its CPU quota counts,
+not the host's core count) split between the `METAFINDER_MAX_CONCURRENT` jobs, and at most one thread per 256 MB
+of `METAFINDER_WORKER_MEMORY_MB`, since every thread loads its own copy of the game. The page reports progress
+game by game. If the very first round can't finish within the time limit, the run says so: lower the games per
+round or the iterations per move.
 
 ## How it works
 

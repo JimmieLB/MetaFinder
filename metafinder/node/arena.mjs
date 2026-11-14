@@ -3,6 +3,7 @@
 // state.withConfig(seatConfig), so only the seat's *judgment* differs; the game itself is played
 // (and, at the turn limit, scored) under the referee config.
 
+import fs from "node:fs";
 import os from "node:os";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { CHANCE, MCTS, Rng, sampleChance } from "./mcts.mjs";
@@ -53,13 +54,18 @@ export function playMatch(game, match) {
 
 /** Runs matches on worker threads, each of which imports the game module once. */
 export class Pool {
-  constructor(repoDir, size = defaultThreads()) {
+  /** heapMb: heap cap per thread, so too many threads fail with a clear error instead of exhausting memory. */
+  constructor(repoDir, size = defaultThreads(), { heapMb } = {}) {
     this.size = size;
     this.workers = [];
     this.idle = [];
     this.queue = [];
     for (let i = 0; i < size; i += 1) {
-      const w = new Worker(new URL(import.meta.url), { workerData: { repoDir }, stdout: true });
+      const w = new Worker(new URL(import.meta.url), {
+        workerData: { repoDir },
+        stdout: true,
+        ...(heapMb ? { resourceLimits: { maxOldGenerationSizeMb: heapMb } } : {}),
+      });
       w.stdout.on("data", () => {}); // the game's own logging is dropped
       w.on("message", (msg) => {
         const job = w.job;
@@ -69,7 +75,12 @@ export class Pool {
         this.next(w);
       });
       w.on("error", (e) => {
-        if (w.job) w.job.reject(e);
+        const err = e?.code === "ERR_WORKER_OUT_OF_MEMORY"
+          ? new Error(`A game thread ran out of memory (${heapMb ?? "default"} MB heap per thread). ` +
+            "Use fewer threads, or give each run more memory.")
+          : e;
+        if (w.job) w.job.reject(err);
+        else for (const job of this.queue.splice(0)) job.reject(err);
         w.job = null;
       });
       this.workers.push(w);
@@ -102,7 +113,31 @@ export class Pool {
 
 export function defaultThreads() {
   const cpus = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
-  return Math.max(1, cpus - 1);
+  return Math.max(1, Math.min(cpus, cpuQuota() ?? Infinity) - 1);
+}
+
+/**
+ * CPUs allowed by the container's CPU quota (Linux cgroups), or null if unlimited. Containers (Railway,
+ * Docker --cpus) usually see every core of the host but may only use a few; os.availableParallelism()
+ * doesn't know that.
+ */
+export function cpuQuota() {
+  const read = (f) => {
+    try {
+      return fs.readFileSync(f, "utf8").trim();
+    } catch {
+      return null;
+    }
+  };
+  const v2 = read("/sys/fs/cgroup/cpu.max"); // "max 100000" or "<quota> <period>"
+  if (v2) {
+    const [quota, period] = v2.split(/\s+/);
+    if (quota !== "max" && Number(quota) > 0 && Number(period) > 0) return Math.max(1, Math.ceil(Number(quota) / Number(period)));
+    return null;
+  }
+  const quota = Number(read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"));
+  const period = Number(read("/sys/fs/cgroup/cpu/cpu.cfs_period_us"));
+  return quota > 0 && period > 0 ? Math.max(1, Math.ceil(quota / period)) : null;
 }
 
 // ---------------------------------------------------------------------------- thread entry

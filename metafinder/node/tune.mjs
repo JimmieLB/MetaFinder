@@ -43,6 +43,8 @@ const HELP = `Tunes a game's AI-scoring values by self-play.
   --more-rounds N     with --resume: train N rounds beyond the checkpoint (instead of up to --rounds)
   --time-limit S      stop starting new rounds so the run, final check included, ends within about
                       S seconds; the checkpoint keeps the progress for --resume
+  --memory-mb N       memory budget for all game threads together: caps each thread's heap and, unless
+                      --threads is given, the thread count (one thread per 256 MB)
   --jsonl             machine-readable progress on stdout, one JSON object per line (used by the web app)
 `;
 
@@ -78,6 +80,7 @@ function parseArgs(argv) {
     else if (a === "--write") o.write = true;
     else if (a === "--seed") o.seed = num(v(), a);
     else if (a === "--more-rounds") o.moreRounds = num(v(), a);
+    else if (a === "--memory-mb") o.memoryMb = num(v(), a);
     else if (a === "--time-limit") o.timeLimit = num(v(), a);
     else if (a === "--jsonl") JSONL = true;
     else fail(`Unknown option ${a} (see --help)`);
@@ -190,9 +193,10 @@ function mulberry32(seed) {
  * Plays `games` games of config A against config B (B fills the other seats), rotating A through
  * every seat. Returns A's scores, each in [0, 1] (its share of the game's returns).
  */
-async function duel(pool, ctx, configA, configB, games, seedBase) {
+async function duel(pool, ctx, configA, configB, games, seedBase, onGame = () => {}) {
   const n = ctx.numPlayers;
   const jobs = [];
+  let done = 0;
   for (let g = 0; g < games; g += 1) {
     const seat = g % n;
     const seed = seedBase + Math.floor(g / n);
@@ -202,6 +206,7 @@ async function duel(pool, ctx, configA, configB, games, seedBase) {
     }));
     jobs.push(pool.play({ ...ctx.match, seed, seats }).then((r) => {
       const total = r.returns.reduce((a, b) => a + b, 0);
+      onGame(++done, games);
       return { score: total > 0 ? r.returns[seat] / total : 1 / n, finished: r.finished };
     }));
   }
@@ -243,7 +248,11 @@ async function main() {
     fail(`Could not start a game with the referee/base config: ${e.message}`);
   }
 
-  const threads = Math.max(1, Math.floor(o.threads ?? defaultThreads()));
+  // Each thread loads its own copy of the game, so the memory budget also limits the thread count.
+  const perThreadMb = 256;
+  let threads = Math.max(1, Math.floor(o.threads ?? defaultThreads()));
+  if (o.memoryMb && o.threads == null) threads = Math.max(1, Math.min(threads, Math.floor(o.memoryMb / perThreadMb)));
+  const heapMb = o.memoryMb ? Math.max(64, Math.floor(o.memoryMb / threads)) : undefined;
   const n = game.numPlayers;
   let games = Math.max(n, Math.floor(o.games ?? threads));
   games -= games % n; // every config plays every seat equally often
@@ -325,14 +334,49 @@ async function main() {
   log(`${rounds - startRound} rounds × ${games} games at ${iterations} iterations/move on ${threads} threads; ` +
     `then ${checkGames} games tuned vs start. Checkpoint: ${outFile}`);
 
-  const pool = new Pool(repo, threads);
+  const pool = new Pool(repo, threads, { heapMb });
   const t0 = performance.now() / 1000;
   const elapsedS = () => performance.now() / 1000 - t0;
   const checkRounds = checkGames / games; // the final check costs about this many rounds
   const valuesText = (cfg) => specs.map((s) => `${s.path}=${getPath(cfg, s.path)}`).join("  ");
   let lastRound = startRound;
   let stoppedEarly = false;
-  progress("train", 0, `Round ${startRound + 1}/${rounds}…`);
+  const resultFor = (final) => ({
+    type: "result",
+    game: { name: game.name, num_players: n },
+    params: specs.map((s) => ({ path: s.path, start: s.start, tuned: getPath(configFor(base, specs, theta), s.path), min: s.min, max: s.max })),
+    ...final,
+    rounds,
+    rounds_this_run: lastRound - startRound,
+    seconds: Math.round(elapsedS()),
+    settings: { iterations, games_per_round: games, threads, check_games: checkGames },
+  });
+
+  // Between rounds the run stops by itself before the limit; this catches a round (or the check) that
+  // overruns it. theta only changes after a full round, so the checkpoint on disk is still current.
+  const deadline = o.timeLimit ? setTimeout(() => {
+    if (lastRound === startRound) {
+      fail(`Round ${startRound + 1} didn't finish within the ${fmtTime(o.timeLimit)} time limit ` +
+        `(${games} games at ${iterations} iterations/move on ${threads} threads), so there is no progress to save. ` +
+        "Lower the games per round or the iterations per move, or allow more time.");
+    }
+    const final = { round: lastRound, check: null, stopped_early: true };
+    save(final);
+    log(`Time limit: stopped during round ${lastRound + 1}; progress up to round ${lastRound} is saved.`);
+    progress("done", 1, "Stopped at the time limit");
+    emit(resultFor(final));
+    process.exit(0);
+  }, o.timeLimit * 1000) : null;
+  deadline?.unref();
+
+  /** Progress inside a round, so a slow round doesn't look stuck. */
+  const roundProgress = (k) => (done, total) => {
+    if (done === total) return; // the end-of-round message follows
+    const left = (elapsedS() / (k - startRound + done / total)) * (rounds - k - done / total);
+    progress("train", (k - startRound + done / total) / (rounds - startRound),
+      `Round ${k + 1}/${rounds}: ${done}/${total} games played · ~${fmtTime(left)} left`);
+  };
+  progress("train", 0, `Round ${startRound + 1}/${rounds}: playing ${games} games on ${threads} threads…`);
   try {
     for (let k = startRound; k < rounds; k += 1) {
       if (o.timeLimit && k > startRound) {
@@ -348,7 +392,8 @@ async function main() {
       const delta = specs.map(() => (rand() < 0.5 ? -1 : 1));
       const plus = clamp(theta.map((t, i) => t + ck * delta[i]));
       const minus = clamp(theta.map((t, i) => t - ck * delta[i]));
-      const res = await duel(pool, ctx, configFor(base, specs, plus), configFor(base, specs, minus), games, seed + k * 1000);
+      const res = await duel(pool, ctx, configFor(base, specs, plus), configFor(base, specs, minus), games, seed + k * 1000,
+        roundProgress(k));
       const score = mean(res.map((r) => r.score));
       const r = score - 1 / n; // > 0: the "+" side was better
       theta = clamp(theta.map((t, i) => t + Math.max(-maxStep, Math.min(maxStep, (ak * r * delta[i]) / ck))));
@@ -374,12 +419,14 @@ async function main() {
     } else {
       log(`Checking: ${checkGames} games, tuned vs starting values…`);
       progress("check", 0, `Checking: ${checkGames} games, tuned vs starting values`);
-      const res = await duel(pool, ctx, tuned, startCfg, checkGames, seed + 9_000_000);
+      const res = await duel(pool, ctx, tuned, startCfg, checkGames, seed + 9_000_000,
+        (done, total) => progress("check", done / total, `Checking: ${done}/${total} games, tuned vs starting values`));
       const scores = res.map((r) => r.score);
       const m = mean(scores);
       const ci = 1.96 * stderr(scores);
       check = { games: checkGames, score: Math.round(m * 1000) / 1000, ci95: Math.round(ci * 1000) / 1000, better: m - ci > 1 / n };
     }
+    if (deadline) clearTimeout(deadline);
     const final = { round: lastRound, check, stopped_early: stoppedEarly };
     save(final);
 
@@ -404,17 +451,9 @@ async function main() {
       log("The tuned values are better. Run again with --write to save them into metafinder.json.");
     }
     progress("done", 1, "Finished");
-    emit({
-      type: "result",
-      game: { name: game.name, num_players: n },
-      params: specs.map((s) => ({ path: s.path, start: s.start, tuned: getPath(tuned, s.path), min: s.min, max: s.max })),
-      ...final,
-      rounds,
-      rounds_this_run: lastRound - startRound,
-      seconds: Math.round(elapsedS()),
-      settings: { iterations, games_per_round: games, threads, check_games: checkGames },
-    });
+    emit(resultFor(final));
   } finally {
+    if (deadline) clearTimeout(deadline);
     await pool.close();
   }
 }

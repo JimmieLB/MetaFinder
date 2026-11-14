@@ -98,14 +98,46 @@ class TuneRequest(BaseModel):
     checkpoint: dict | None = Field(None, description="Saved training progress (a metafinder.tuned.json) to resume")
 
 
-def tune_threads() -> int:
-    if TUNE_THREADS > 0:
-        return TUNE_THREADS
+TUNE_MB_PER_THREAD = 256  # each training thread loads its own copy of the game
+
+
+def _cgroup_cpus() -> int | None:
+    """CPUs allowed by the container's CPU quota, or None if unlimited. Containers (Railway, docker --cpus)
+    usually see every core of the host but may only use a few, and os.cpu_count() doesn't know that."""
+    def read(p: str) -> str | None:
+        try:
+            return Path(p).read_text().strip()
+        except OSError:
+            return None
+    v2 = read("/sys/fs/cgroup/cpu.max")  # "max 100000" or "<quota> <period>"
+    if v2:
+        quota, _, period = v2.partition(" ")
+        if quota != "max" and quota.isdigit() and period.isdigit() and int(period) > 0:
+            return max(1, -(-int(quota) // int(period)))
+        return None
+    quota, period = read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota and period and quota.isdigit() and period.isdigit() and int(quota) > 0 and int(period) > 0:
+        return max(1, -(-int(quota) // int(period)))
+    return None
+
+
+def available_cpus() -> int:
     try:
         cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         cpus = os.cpu_count() or 2
-    return max(1, cpus - 1)
+    quota = _cgroup_cpus()
+    return min(cpus, quota) if quota else cpus
+
+
+def tune_threads() -> int:
+    """Threads per training run: METAFINDER_TUNE_THREADS, else CPUs − 1, limited by the memory budget and
+    shared between the runs allowed at once."""
+    if TUNE_THREADS > 0:
+        return TUNE_THREADS
+    by_cpu = max(1, (available_cpus() - 1) // max(1, MAX_CONCURRENT))
+    by_memory = max(1, WORKER_MEMORY_MB // TUNE_MB_PER_THREAD)
+    return min(by_cpu, by_memory)
 
 
 def parse_source(url: str) -> dict:
@@ -182,8 +214,10 @@ def worker_command(runtime: str, repo_dir: Path, params_path: Path) -> list[str]
 
 def tune_command(repo_dir: Path, out_path: Path, params: dict, resume: bool) -> list[str]:
     threads = tune_threads()
-    cmd = [node_binary(), f"--max-old-space-size={WORKER_MEMORY_MB}", str(ROOT / "metafinder" / "node" / "tune.mjs"),
+    # The main thread only coordinates; the game threads share the memory budget (--memory-mb caps each heap).
+    cmd = [node_binary(), "--max-old-space-size=256", str(ROOT / "metafinder" / "node" / "tune.mjs"),
            "--repo", str(repo_dir), "--out", str(out_path), "--jsonl", "--threads", str(threads),
+           "--memory-mb", str(WORKER_MEMORY_MB),
            "--iterations", str(params["iterations"]), "--exploration", str(params["exploration"]),
            # Stop early enough to finish cleanly (and save) before the hard kill.
            "--time-limit", str(max(30, TUNE_TIMEOUT - 30))]
