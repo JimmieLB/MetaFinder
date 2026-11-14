@@ -7,9 +7,8 @@
 // Anything the game prints (console.log, process.stdout.write) goes to stderr so it cannot corrupt the protocol.
 
 import fs from "node:fs";
-import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { CHANCE, MCTS, Rng, actionKey, proofStatus, rankChildren, sampleChance } from "./mcts.mjs";
+import { GameError, loadGame } from "./load.mjs";
 
 // ---------------------------------------------------------------------------- protocol output
 function writeOut(text) {
@@ -40,58 +39,6 @@ function emit(obj) {
 
 function progress(phase, pct, message = "") {
   emit({ type: "progress", phase, pct: Math.round(pct * 1000) / 1000, message });
-}
-
-class GameError extends Error {}
-
-// ---------------------------------------------------------------------------- loading
-const JS_ENTRY_FILES = ["metafinder_game.mjs", "metafinder_game.js", "metafinder_game.ts"];
-
-async function loadGame(repoDir) {
-  const manifestPath = path.join(repoDir, "metafinder.json");
-  let manifest = {};
-  let entry;
-  if (fs.existsSync(manifestPath)) {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-    entry = manifest.entry;
-    if (!entry) throw new GameError('metafinder.json must contain an "entry" like "src/adapter.js:GAME"');
-  } else {
-    const file = JS_ENTRY_FILES.find((f) => fs.existsSync(path.join(repoDir, f)));
-    if (!file) throw new GameError("No metafinder.json (or metafinder_game.js) found at the repo root.");
-    entry = `${file}:GAME`;
-  }
-
-  const m = /^(.*):([A-Za-z_$][\w$]*)$/.exec(entry);
-  const file = m ? m[1] : entry;
-  const attr = m ? m[2] : "GAME";
-  const full = path.resolve(repoDir, file);
-  const root = path.resolve(repoDir);
-  if (full !== root && !full.startsWith(root + path.sep)) throw new GameError(`Entry '${file}' is outside the repository`);
-  if (!fs.existsSync(full)) throw new GameError(`Entry file '${file}' not found (paths are relative to metafinder.json)`);
-
-  let module;
-  try {
-    module = await import(pathToFileURL(full).href);
-  } catch (e) {
-    throw new GameError(`Could not import '${file}': ${e?.stack || e}`);
-  }
-  let game = module[attr];
-  if (game === undefined && attr === "GAME") game = module.default; // `export default` also works
-  if (game == null) throw new GameError(`'${file}' has no export named '${attr}'`);
-  if (typeof game === "function" && typeof game.newGame !== "function") {
-    const isClass = /^class[\s{]/.test(Function.prototype.toString.call(game));
-    game = isClass ? new game() : game();
-  }
-  game = await game;
-
-  const missing = ["name", "numPlayers", "perfectInformation", "newGame"].filter((a) => game[a] === undefined);
-  if (missing.length) {
-    throw new GameError(
-      `Game module is missing required properties: ${missing.join(", ")} ` +
-      "(JavaScript modules use camelCase: numPlayers, perfectInformation, newGame, legalActions, …)",
-    );
-  }
-  return [game, manifest.config ?? {}];
 }
 
 // ---------------------------------------------------------------------------- helpers
@@ -250,6 +197,7 @@ function makeEngine(game, params, rng, iterations = null) {
     maxDepth: params.rollout_depth,
     rolloutPolicy: (params.use_module_rollout ?? true) ? rollout : null,
     rng,
+    reuseTree: params.tree_reuse ?? true,
   });
 }
 
@@ -338,6 +286,8 @@ function playGame(game, config, seed, seatAgents, maxSteps, record = false, stat
   const transcript = [];
   const events = new Counter();
   const hasKey = typeof s.strategyKey === "function";
+  const engines = [...new Set(seatAgents.filter(Boolean))];
+  for (const e of engines) e.resetTree?.();
   while (!s.isTerminal() && steps < maxSteps) {
     if (stopAt !== null && now() > stopAt) {
       cut = true;
@@ -387,6 +337,7 @@ function playGame(game, config, seed, seatAgents, maxSteps, record = false, stat
       }
     }
     s.apply(a);
+    for (const e of engines) e.advance?.(a); // keeps each engine's tree in step with the game
     for (const ev of drain(s)) events.add(eventKey(ev));
     steps += 1;
   }

@@ -87,7 +87,7 @@ export function terminalOrHeuristic(state, nPlayers) {
 export class MCTS {
   constructor({
     nPlayers, perfectInformation, iterations = 1000, timeLimit = null, exploration = 0.7,
-    maxDepth = 200, rolloutPolicy = null, rng = new Rng(),
+    maxDepth = 200, rolloutPolicy = null, rng = new Rng(), reuseTree = false,
   }) {
     this.nPlayers = nPlayers;
     this.perfectInformation = perfectInformation;
@@ -98,10 +98,42 @@ export class MCTS {
     this.rolloutPolicy = rolloutPolicy;
     this.rng = rng;
     this.solver = perfectInformation;
+    // Tree reuse: keep the subtree under the moves actually played, so the next search starts with
+    // the visits it already has. Only sound with perfect information (the tree is keyed by the
+    // real sequence of actions); the caller must report every action with advance().
+    this.reuseTree = Boolean(reuseTree && perfectInformation);
+    this.tree = null;
+  }
+
+  /** Reports an action played in the real game (by any player, or chance) for tree reuse. */
+  advance(action) {
+    if (!this.tree) return;
+    const child = this.tree.children.get(actionKey(action));
+    if (child) child.parent = null; // lets the rest of the old tree be garbage-collected
+    this.tree = child ?? null;
+  }
+
+  /** Forgets the kept tree (e.g. before a new game). */
+  resetTree() {
+    this.tree = null;
+  }
+
+  /** The kept subtree if it matches `state`, else null. */
+  reusableRoot(state) {
+    const root = this.tree;
+    this.tree = null;
+    if (!root) return null;
+    const player = state.currentPlayer();
+    if (root.toMove !== null && root.toMove !== player) return null;
+    if (player !== CHANCE) {
+      const legal = new Set(state.legalActions().map(actionKey));
+      for (const key of root.children.keys()) if (!legal.has(key)) return null; // out of sync: start over
+    }
+    return root;
   }
 
   search(rootState, observer, onProgress = null) {
-    const root = new Node(null, null, observer, this.nPlayers);
+    const root = (this.reuseTree && this.reusableRoot(rootState)) || new Node(null, null, observer, this.nPlayers);
     const deadline = this.timeLimit ? performance.now() + this.timeLimit * 1000 : null;
     const reportEvery = Math.max(1, Math.floor(this.iterations / 20));
     for (let i = 0; i < this.iterations; i += 1) {
@@ -118,6 +150,7 @@ export class MCTS {
       }
       if (root.proven !== null) break; // game-theoretic value of the root is known
     }
+    if (this.reuseTree) this.tree = root;
     return root;
   }
 

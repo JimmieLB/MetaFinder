@@ -260,7 +260,38 @@ JavaScript-specific rules:
 
 See [examples/takeaway-js](examples/takeaway-js) for a complete module.
 
-## How it works
+## Tuning the AI (Node.js modules)
+
+The AI's judgment comes from your scoring values, such as what a building or unit is worth. The tuner improves
+them by self-play, so each run leaves the AI a bit stronger:
+
+```bash
+node metafinder/node/tune.mjs --repo ../my-game            # tune, then report tuned vs starting values
+node metafinder/node/tune.mjs --repo ../my-game --write    # …and save them into metafinder.json if clearly better
+node metafinder/node/tune.mjs --help                       # all options
+```
+
+Each round nudges every tuned value up or down at random, plays the "+" and "−" versions against each other
+(seats swapped, games spread over all CPU cores), and moves the values toward the side that scored better
+(SPSA). Finally the tuned values play the starting values, and `--write` saves them only if they win clearly.
+The next run starts from the saved values. Progress is checkpointed to `metafinder.tuned.json` after every round,
+so `--resume` continues an interrupted run.
+
+It needs two things from the module:
+
+- A `"tune"` list in `metafinder.json` naming positive numbers in `config`, as dotted paths, optionally with
+  bounds (by default ¼× to 4× the starting value). Tune only values that change the AI's judgment, never the rules.
+  ```json
+  "tune": ["unit_value_scale", "objective_values.hq", { "path": "objective_values.city", "min": 500, "max": 8000 }]
+  ```
+- `state.withConfig(config)`: a copy of the state that values positions (in `heuristicValue()` and the rollout
+  policy) with that config's scoring values and keeps everything else, so the two seats can judge differently.
+
+Games that hit the turn limit are scored by a fixed referee: the config with the tuned keys removed (the module's
+defaults), or `--referee '{…}'`. A fixed referee stops the tuner from just agreeing with itself. Tuning uses 150
+iterations per move by default (`--iterations`). Values tuned for weak search may not carry over to much stronger
+search, so tune near the iteration count you analyse with if you have the time.
+
 
 - `metafinder/mcts.py`: single-observer IS-MCTS with chance nodes. Perfect-information games also get an
   MCTS-Solver, which propagates proven wins and losses up the tree.
@@ -268,6 +299,10 @@ See [examples/takeaway-js](examples/takeaway-js) for a complete module.
   self-play → baseline against random players. It streams JSON-lines progress.
 - `metafinder/node/mcts.mjs`, `metafinder/node/worker.mjs`: the same search and worker in JavaScript, used
   for `"runtime": "node"` modules. They produce identical result JSON, so the UI doesn't need to know which ran.
+- Tree reuse: in self-play and the baseline, each player keeps the part of its search tree under the moves
+  actually played, so its next search starts with those visits instead of from nothing (perfect-information games
+  only). Set `"tree_reuse": false` in the job parameters to turn it off.
+- `metafinder/node/tune.mjs`, `metafinder/node/arena.mjs`: the tuner (see [Tuning the AI](#tuning-the-ai-nodejs-modules)).
 - `metafinder/server.py`: FastAPI. Clones with `git clone --depth 1`, runs one worker per job (default
   limit is 2 at a time, with a timeout), and serves `static/index.html`.
 

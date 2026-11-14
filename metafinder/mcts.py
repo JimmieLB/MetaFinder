@@ -74,6 +74,7 @@ class MCTS:
         max_depth: int = 200,
         rollout_policy: Callable[[Any, random.Random], Hashable] | None = None,
         rng: random.Random | None = None,
+        reuse_tree: bool = False,
     ):
         self.n_players = n_players
         self.perfect_information = perfect_information
@@ -84,10 +85,40 @@ class MCTS:
         self.rollout_policy = rollout_policy
         self.rng = rng or random.Random()
         self.solver = perfect_information
+        # Tree reuse: keep the subtree under the moves actually played, so the next search starts with
+        # the visits it already has. Only sound with perfect information (the tree is keyed by the
+        # real sequence of actions); the caller must report every action with advance().
+        self.reuse_tree = bool(reuse_tree and perfect_information)
+        self.tree: Node | None = None
+
+    def advance(self, action: Hashable) -> None:
+        """Reports an action played in the real game (by any player, or chance) for tree reuse."""
+        if self.tree is None:
+            return
+        child = self.tree.children.get(action)
+        if child is not None:
+            child.parent = None  # lets the rest of the old tree be garbage-collected
+        self.tree = child
+
+    def reset_tree(self) -> None:
+        self.tree = None
+
+    def _reusable_root(self, state) -> Node | None:
+        root, self.tree = self.tree, None
+        if root is None:
+            return None
+        player = state.current_player()
+        if root.to_move is not None and root.to_move != player:
+            return None
+        if player != CHANCE:
+            legal = set(state.legal_actions())
+            if any(a not in legal for a in root.children):
+                return None  # out of sync with the game: start over
+        return root
 
     # ------------------------------------------------------------------ search
     def search(self, root_state, observer: int, on_progress: Callable[[int], None] | None = None) -> Node:
-        root = Node(None, None, observer, self.n_players)
+        root = (self._reusable_root(root_state) if self.reuse_tree else None) or Node(None, None, observer, self.n_players)
         deadline = time.perf_counter() + self.time_limit if self.time_limit else None
         report_every = max(1, self.iterations // 20)
         for i in range(self.iterations):
@@ -110,6 +141,8 @@ class MCTS:
                 node = node.parent
             if root.proven is not None:
                 break  # game-theoretic value of the root is known; more search is pointless
+        if self.reuse_tree:
+            self.tree = root
         return root
 
     def _select_expand(self, node: Node, state) -> tuple[Node, int]:

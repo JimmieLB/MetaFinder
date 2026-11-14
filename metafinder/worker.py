@@ -299,6 +299,7 @@ def make_engine(game, params, rng, iterations=None):
         max_depth=params["rollout_depth"],
         rollout_policy=rollout if params.get("use_module_rollout", True) else None,
         rng=rng,
+        reuse_tree=params.get("tree_reuse", True),
     )
 
 
@@ -313,6 +314,9 @@ def play_game(game, config, seed, seat_agents, max_steps, record=False, stats=No
     events = Counter()
     strategy_key = getattr(s, "strategy_key", None)
     cut = False
+    engines = list({id(e): e for e in seat_agents if e is not None}.values())
+    for e in engines:
+        e.reset_tree()
     while not s.is_terminal() and steps < max_steps:
         if stop_at is not None and time.perf_counter() > stop_at:
             cut = True
@@ -353,6 +357,8 @@ def play_game(game, config, seed, seat_agents, max_steps, record=False, stats=No
                         ][:2],
                     })
         s.apply(a)
+        for e in engines:
+            e.advance(a)  # keeps each engine's tree in step with the game
         for ev in drain(s):
             events[event_key(ev)] += 1
         steps += 1
